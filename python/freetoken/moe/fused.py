@@ -44,6 +44,17 @@ def fused_topk(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
+    from freetoken.kernel.backend import is_rocm
+
+    # #257's top-10 router branch sits BELOW the triton_kernels gate that #134 forces
+    # False on ROCm, so qwen4_exp would silently take the pure-torch reference router.
+    # Route ROCm to the vendored triton router first. FREETOKEN_ROCM_TRITON_ROUTER=0
+    # restores the reference route for an A/B.
+    if is_rocm() and os.environ.get("FREETOKEN_ROCM_TRITON_ROUTER", "1") == "1":
+        from freetoken.kernel.triton.moe_router import fused_topk_softmax
+
+        return fused_topk_softmax(gating_output, topk, renormalize, num_token_non_padded)
+
     from freetoken.kernel.backend import is_triton_kernels_installed
 
     # triton_kernels ships no Windows wheel, and unlike flashinfer/sgl_kernel it is not one
