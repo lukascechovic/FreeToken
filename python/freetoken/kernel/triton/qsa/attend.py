@@ -277,6 +277,16 @@ def qsa_sparse_paged_attention(
     else:
         block_n, target_splits, partial_warps = 64, 1, 2
 
+    # llm-server #714: RDNA (gfx1201) has 64 KiB of LDS per workgroup; the profile above was
+    # tuned on GB300. The K tile [head_dim, BLOCK_N] and the V tile [BLOCK_N, head_dim] alone
+    # cost 2 * head_dim * block_n * itemsize, which at head_dim=256 and block_n=64 is exactly
+    # 65536 B -- the whole budget -- and the launch then asks for 65792 and Triton refuses with
+    # OutOfResources. Halve the tile until the pair fits with room for the index scratch.
+    if torch.version.hip is not None:
+        _lds_budget = 60 * 1024
+        while block_n > 16 and 2 * head_dim * block_n * q.element_size() > _lds_budget:
+            block_n //= 2
+
     num_tiles = triton.cdiv(logical_indices.shape[1], block_n)
     # Avoid empty splits when the selection width is smaller than the profile.
     max_useful_splits = 1 << (num_tiles.bit_length() - 1)
