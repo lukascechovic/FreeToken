@@ -8,8 +8,10 @@ from freetoken.layers import BaseOP, LinearColParallelMerged
 
 from freetoken.kernel.triton.fp8_block_linear import Fp8BlockColMerged
 from freetoken.kernel.triton.fp8_pertensor_linear import Fp8PerTensorColMerged
+from freetoken.distributed import get_tp_info
 from freetoken.models.qwen3_5_moe.gdn_kernels import gdn_decode_fla, gdn_prefill_chunk_fla
-from freetoken.models.quant_linear import make_replicated_quant
+from freetoken.models.quant_linear import make_row_parallel_quant
+from freetoken.utils import div_even
 
 
 _GATE_ACTIVATIONS = ("silu", "swish", "sigmoid")
@@ -72,14 +74,30 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         assert head_k_dim == head_v_dim, (
             f"GatedDeltaNet requires head_k_dim == head_v_dim, got {head_k_dim} != {head_v_dim}"
         )
-        self.num_k_heads = num_k_heads
-        self.num_v_heads = num_v_heads
+        # Head counts, and every width derived from them, are RANK-LOCAL. The division is the
+        # one LinearStatePool._linear_local_dims already uses, so the conv/recurrent state slots
+        # and this module's tensors agree; ⛔⛆ a module that kept the full widths would slice the
+        # next rank's heads out of its own (correctly halved) GEMM result.
+        tp_size = get_tp_info().size
+        self.num_k_heads = div_even(num_k_heads, tp_size, allow_replicate=True)
+        self.num_v_heads = div_even(num_v_heads, tp_size, allow_replicate=True)
         self.head_k_dim = head_k_dim
         self.head_v_dim = head_v_dim
-        self.key_dim = num_k_heads * head_k_dim
-        self.value_dim = num_v_heads * head_v_dim
+        self.key_dim = self.num_k_heads * head_k_dim
+        self.value_dim = self.num_v_heads * head_v_dim
         self.conv_dim = 2 * self.key_dim + self.value_dim
         self.conv_kernel_size = conv_kernel_size
+        full_key_dim = num_k_heads * head_k_dim
+        full_value_dim = num_v_heads * head_v_dim
+        full_conv_dim = 2 * full_key_dim + full_value_dim
+        # LinearColParallelMerged divides each DECLARED size by tp_size, so the local conv_dim
+        # built from local head counts must be that quotient -- it is not when only one of the
+        # two head counts replicates. Fail here rather than build a layer of the wrong width.
+        assert self.conv_dim * tp_size == full_conv_dim, (
+            f"local conv_dim {self.conv_dim} does not tile {full_conv_dim} at tp_size={tp_size}: "
+            f"k heads {num_k_heads} -> {self.num_k_heads}, v heads {num_v_heads} -> "
+            f"{self.num_v_heads} divide differently"
+        )
         # qkv|z carry a weight scale (block-fp8 weight_scale_inv, or per-tensor FP8
         # weight_scale); b|a stay bf16. Both quant modes therefore split the four-way
         # fusion into an fp8 qkvz GEMM + a bf16 ba GEMM (matches sglang/vLLM).
@@ -87,8 +105,18 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         self._pertensor_fp8 = attn_quant == "fp8_pertensor"
         self._fp8 = self._block_fp8 or self._pertensor_fp8
 
-        self._in_proj_split = [self.conv_dim, self.value_dim, num_v_heads, num_v_heads]
+        # b|a are ONE COLUMN PER V HEAD, so they shard with the v heads like everything else.
+        self._in_proj_split = [
+            self.conv_dim, self.value_dim, self.num_v_heads, self.num_v_heads
+        ]
         if self._fp8:
+            # ⛔⛆ The fp8 input projections are not TP-aware (a per-tensor scale is fitted to the
+            # full row; a block scale grid is indexed in 128-wide tiles), so refuse rather than
+            # emit a layer of the right shape that computes the wrong number.
+            if tp_size > 1:
+                raise NotImplementedError(
+                    f"GDN fp8 in_proj is not implemented at tp_size={tp_size}"
+                )
             ColMerged = Fp8BlockColMerged if self._block_fp8 else Fp8PerTensorColMerged
             self.in_proj_qkvz = ColMerged(
                 hidden_size, [self.conv_dim, self.value_dim], has_bias=False
@@ -97,21 +125,33 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
                 hidden_size, [num_v_heads, num_v_heads], has_bias=False
             )
         else:
-            # Fused input projection (one GEMM instead of four): qkv | z | b | a.
-            self.in_proj = LinearColParallelMerged(hidden_size, self._in_proj_split, has_bias=False)
+            # Fused input projection (one GEMM instead of four): qkv | z | b | a. Declared with
+            # the FULL widths -- the layer shards them itself.
+            self.in_proj = LinearColParallelMerged(
+                hidden_size,
+                [full_conv_dim, full_value_dim, num_v_heads, num_v_heads],
+                has_bias=False,
+            )
+            assert sum(self._in_proj_split) == self.in_proj.local_output_size, (
+                f"declared split {self._in_proj_split} does not tile the local GEMM width "
+                f"{self.in_proj.local_output_size} at tp_size={tp_size}"
+            )
         self.conv1d = _DepthwiseConv1d(self.conv_dim, conv_kernel_size)
         # Recurrence-gating params kept in fp32 (exp/softplus is precision-sensitive,
         # and the fla kernel reads them as fp32) -- matches HF/sglang, and avoids a
         # per-call .float() upcast in the decode wrapper. The weight loader exempts
         # *.A_log / *.dt_bias from the model-dtype downcast.
-        self.dt_bias = torch.empty(num_v_heads, dtype=torch.float32)
-        self.A_log = torch.empty(num_v_heads, dtype=torch.float32)
+        # One entry per v head -> rank-local, like b|a which they gate.
+        self.dt_bias = torch.empty(self.num_v_heads, dtype=torch.float32)
+        self.A_log = torch.empty(self.num_v_heads, dtype=torch.float32)
         self.norm = _GatedRMSNorm(head_v_dim, eps=rms_norm_eps, activation=output_gate)
         # out_proj follows the checkpoint quant: block-fp8 / per-tensor-fp8 / compressed-tensors
         # NVFP4 (W4A16) / bf16. in_proj_* stay bf16 in every mode (above), so a compressed-tensors
         # NVFP4 checkpoint (attn_quant=="nvfp4") only makes out_proj native FP4.
-        self.out_proj = make_replicated_quant(
-            expert_quant, attn_quant, self.value_dim, hidden_size, has_bias=False
+        # Column-sharded v heads mean each rank's core output is a PARTIAL sum: row-parallel,
+        # all-reduces at TP>1, and declared with the FULL value_dim (the layer splits it).
+        self.out_proj = make_row_parallel_quant(
+            expert_quant, attn_quant, full_value_dim, hidden_size, has_bias=False
         )
 
     def _gate_params(self, a: torch.Tensor, b: torch.Tensor):

@@ -30,6 +30,8 @@ from freetoken.models.qwen4_exp.weight import (
 from freetoken.moe.host_banks import HostResidency
 from freetoken.utils import cached_load_hf_config
 
+from .common import EXPERT_BUFFERS, as_rank, model_buffer_shapes
+
 MODEL_PATH = os.environ.get("FREETOKEN_QWEN4EXP_MODEL")
 pytestmark = [
     pytest.mark.needs_weights,
@@ -188,20 +190,7 @@ def test_emitted_names_are_unique_and_complete(dense_pass):
 
 @pytest.fixture(scope="module")
 def model_state_dict_keys() -> set[str]:
-    """Keys ``Qwen4ExpForCausalLM`` declares -- the authoritative target the loader must fill."""
-    from freetoken.layers import rotary
-    from freetoken.models.qwen4_exp.model import Qwen4ExpForCausalLM
-
-    config = parse_config(cached_load_hf_config(MODEL_PATH))
-    saved = rotary._ROPE_DEVICE
-    rotary.set_rope_device(torch.device("cpu"))  # get_rope refuses to build on meta
-    rotary.get_rope.cache_clear()
-    try:
-        with torch.device("meta"):
-            return set(Qwen4ExpForCausalLM(config).state_dict())
-    finally:
-        rotary.set_rope_device(saved)
-        rotary.get_rope.cache_clear()
+    return set(model_buffer_shapes(MODEL_PATH, 0, 1))
 
 
 def test_emitted_names_are_the_model_state_dict(dense_pass, model_state_dict_keys):
@@ -336,3 +325,71 @@ def test_dummy_expert_sources_have_the_real_bank_shapes(layer0_expert_banks):
     for name, banks in dummy.items():
         assert banks[0].shape == layer0_expert_banks[name][0].shape
         assert banks[0].dtype is layer0_expert_banks[name][0].dtype
+
+
+# ======================================================================================
+# TP=2 on the REAL checkpoint: every loader key matches its model buffer (#777, bullet 6)
+# ======================================================================================
+#
+# ⭐ This is the instrument that closes #725. That round banked **290 shape mismatches** when
+# `--tp-size 2` tried to load this checkpoint; the whole of bullets 2-5 exists to take them to
+# zero, and only the real 48-layer geometry can say so -- the synthetic checkpoint in
+# `test_weight.py` has two layers and divides evenly almost everywhere.
+#
+# ⛔⛆ Names are not the test. Every one of the 290 carried the model's OWN state-dict key and a
+# tensor of the wrong width, so the walk compares SHAPES, at BOTH ranks.
+#
+# ⚠ Each rank is a full dense sweep of the checkpoint (the PLE table and the routed experts are
+# not in it), so this pass reads the bf16 shards twice. Nothing is kept but the shapes.
+
+
+
+@pytest.fixture(scope="module")
+def tp2_emitted_shapes() -> dict[int, dict[str, tuple[int, ...]]]:
+    """`{rank: {name: shape}}` for a TP=2 dense load of the real checkpoint."""
+    out: dict[int, dict[str, tuple[int, ...]]] = {}
+    for rank in (0, 1):
+        with as_rank(rank, 2):
+            out[rank] = {
+                name: tuple(tensor.shape)
+                for name, tensor in iter_weights(
+                    MODEL_PATH, torch.device("cpu"),
+                    include_moe_experts=True, include_non_moe=True,
+                )
+            }
+    return out
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("rank", (0, 1))
+def test_every_loader_tensor_fits_its_tp2_buffer(tp2_emitted_shapes, rank):
+    """⛔⛆ #725's 290 mismatches, at zero, on the DEPLOYED geometry."""
+    declared = model_buffer_shapes(MODEL_PATH, rank, 2)
+    emitted = tp2_emitted_shapes[rank]
+    assert set(emitted) == {k for k in declared if not k.endswith(EXPERT_BUFFERS)}
+    mismatched = {
+        name: (shape, declared[name]) for name, shape in emitted.items()
+        if shape != declared[name]
+    }
+    assert mismatched == {}
+
+
+@pytest.mark.slow
+def test_tp2_actually_narrows_the_real_model(tp2_emitted_shapes):
+    """⛔⛆ Guard on the instrument: a walk that compared a TP=1 model against a TP=1 loader would
+    pass while proving nothing. The mixers, the vocab pair and the shared expert must have moved,
+    and a GDN layer, a QSA layer and the embedding are each represented."""
+    tp1 = model_buffer_shapes(MODEL_PATH, 0, 1)
+    tp2 = model_buffer_shapes(MODEL_PATH, 0, 2)
+    assert set(tp1) == set(tp2)
+    narrowed = {k for k in tp1 if tp2[k] != tp1[k]}
+    assert {"model.embed_tokens.weight", "lm_head.weight"} <= narrowed
+    assert len([k for k in narrowed if k.endswith(".linear_attn.in_proj.weight")]) == 36
+    assert len([k for k in narrowed if k.endswith(".linear_attn.conv1d.weight")]) == 36
+    assert len([k for k in narrowed if k.endswith(".linear_attn.out_proj.weight")]) == 36
+    assert len([k for k in narrowed if k.endswith(".self_attn.qkv_proj.weight")]) == 12
+    assert len([k for k in narrowed if k.endswith(".self_attn.o_proj.weight")]) == 12
+    assert len([k for k in narrowed
+                if k.endswith(".mlp.shared_expert.gate_up_proj.weight")]) == NUM_LAYERS
+    # Both ranks declare the same widths: every collective in this model is shape-symmetric.
+    assert model_buffer_shapes(MODEL_PATH, 1, 2) == tp2

@@ -8,6 +8,7 @@ down so a test fits on a shared GPU. Holds no tests itself.
 
 from __future__ import annotations
 
+import contextlib
 from types import SimpleNamespace
 
 import pytest
@@ -19,6 +20,54 @@ EOS = 7
 VOCAB = 512
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+
+
+@contextlib.contextmanager
+def as_rank(rank: int, size: int):
+    """Run the block as one rank of a ``size``-way TP group (set_tp_info is write-once)."""
+    from freetoken.distributed import info
+
+    saved = info._TP_INFO
+    info._TP_INFO = info.DistributedInfo(rank=rank, size=size)
+    try:
+        yield
+    finally:
+        info._TP_INFO = saved
+
+
+# The routed experts never come from the dense pass -- they are NVFP4 and are filled from the
+# offload cache's source banks by ``load_nvfp4_expert_sources``.
+EXPERT_BUFFERS = (".mlp.experts.gate_up_proj", ".mlp.experts.down_proj")
+
+
+def model_buffer_shapes(folder: str, rank: int, size: int) -> dict[str, tuple[int, ...]]:
+    """Every buffer ``Qwen4ExpForCausalLM`` declares for this rank -- the authoritative target
+    the loader must fill -- by state-dict key.
+
+    Built on the meta device, so the real checkpoint's 111 GiB of weights are never touched. It
+    has to compare SHAPES, and it has to do it at every rank, because a rank-1 buffer is not a
+    rank-0 buffer once the vocab, the kv heads or the v heads stop dividing evenly.
+
+    ⚠ ``get_rope`` materialises its cos/sin cache eagerly and refuses to do it on the meta
+    device, so the rope device is forced to cpu around the build and restored afterwards.
+    """
+    from freetoken.layers import rotary
+    from freetoken.models.qwen4_exp.config import parse_config
+    from freetoken.models.qwen4_exp.model import Qwen4ExpForCausalLM
+    from freetoken.utils import cached_load_hf_config
+
+    saved = rotary._ROPE_DEVICE
+    rotary.set_rope_device(torch.device("cpu"))
+    rotary.get_rope.cache_clear()
+    try:
+        with as_rank(rank, size):
+            config = parse_config(cached_load_hf_config(folder))
+            with torch.device("meta"):
+                model = Qwen4ExpForCausalLM(config)
+            return {k: tuple(v.shape) for k, v in model.state_dict().items()}
+    finally:
+        rotary.set_rope_device(saved)
+        rotary.get_rope.cache_clear()
 
 
 def hf_config(
