@@ -43,10 +43,12 @@ from .generation import (
     ToolCallArgsDelta,
     ToolCallsDelta,
     ToolCallStart,
+    allow_remote_images,
     count_prompt_tokens,
     generate_events,
     generate_full,
-    render_messages,
+    prerender_error,
+    render_messages_multimodal,
     resolve_sampling,
     split_tool_lists,
     submit_generation,
@@ -116,7 +118,20 @@ async def handle_anthropic_messages(
         spec = convert_anthropic_to_genspec(
             req, model_sampling,
             reasoning_parser=getattr(state.config, "reasoning_parser", None),
+            allow_remote_images=allow_remote_images(state),
         )
+    except ValueError as exc:
+        return _anthropic_error_response(400, "invalid_request_error", str(exc))
+
+    if spec.images:
+        # Pre-commit, on BOTH the streaming and the non-streaming path: opening the picture
+        # and measuring the expanded prompt are the two checks that must not arrive after an
+        # SSE header, and neither costs anything on a text request.
+        err = await prerender_error(spec, state)
+        if err is not None:
+            return _anthropic_error_response(400, "invalid_request_error", str(err))
+
+    try:
         uid = await submit_generation(spec, state)
     except ValueError as exc:
         return _anthropic_error_response(400, "invalid_request_error", str(exc))
@@ -148,8 +163,10 @@ async def handle_anthropic_count_tokens(req: AnthropicCountTokensRequest, state:
     # a checkpoint whose chat template raises ValueError is a server fault, not a bad request,
     # so it must not fall into the convert/empty-prompt ValueError branch.
     try:
-        messages, template_tools, _, ctk = convert_anthropic_prompt(
-            req, reasoning_parser=getattr(state.config, "reasoning_parser", None)
+        messages, template_tools, _, ctk, images = convert_anthropic_prompt(
+            req,
+            reasoning_parser=getattr(state.config, "reasoning_parser", None),
+            allow_remote_images=allow_remote_images(state),
         )
     except ValueError as exc:
         return _anthropic_error_response(400, "invalid_request_error", str(exc))
@@ -160,7 +177,7 @@ async def handle_anthropic_count_tokens(req: AnthropicCountTokensRequest, state:
             400, "invalid_request_error", "messages: no tokenizable content"
         )
     try:
-        n_tokens = await count_prompt_tokens(messages, template_tools, ctk, state)
+        n_tokens = await count_prompt_tokens(messages, template_tools, ctk, state, images)
     except GenerationError as exc:
         # The chat template could not render this conversation (bad role ordering, an unmatched
         # tool_result, ...) — a client error, exactly as /v1/messages classifies the same failure.
@@ -178,8 +195,15 @@ async def handle_anthropic_count_tokens(req: AnthropicCountTokensRequest, state:
 def convert_anthropic_prompt(
     req: AnthropicMessagesRequest | AnthropicCountTokensRequest,
     reasoning_parser: str | None = None,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | None, list[dict[str, Any]] | None, dict[str, Any]]:
-    """(messages, template_tools, parser_tools, chat_template_kwargs) — the prompt
+    allow_remote_images: bool = False,
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]] | None,
+    list[dict[str, Any]] | None,
+    dict[str, Any],
+    list[bytes],
+]:
+    """(messages, template_tools, parser_tools, chat_template_kwargs, images) — the prompt
     side of the conversion, shared by /v1/messages and /v1/messages/count_tokens so
     a counted prompt is exactly the prompt a generation would tokenize."""
     # Collect all system content (top-level `system` + any system-role messages
@@ -214,8 +238,11 @@ def convert_anthropic_prompt(
                 # -> reasoning_content; redacted_thinking stays skipped (opaque payload).
                 thinking_parts.append(block.thinking)
             elif block.type == "image":
-                # Text-only server: drop image blocks rather than failing the request.
-                continue
+                # Never `continue` here again. Dropping the block returned a confident 200
+                # about a picture the model never saw, which is how this row was believed to
+                # have vision. The source rides through as a marker and `_render_parts`
+                # decodes it -- a payload this server cannot serve is then a 4xx.
+                content_parts.append({"type": "image", "source": block.source})
             elif block.type == "tool_use":
                 tool_calls.append(
                     {
@@ -296,19 +323,22 @@ def convert_anthropic_prompt(
         elif req.thinking.get("type") == "disabled":
             ctk = thinking_toggle_kwargs(False)
 
-    return render_messages(messages), template_tools, parser_tools, ctk
+    rendered, images = render_messages_multimodal(messages, allow_remote=allow_remote_images)
+    return rendered, template_tools, parser_tools, ctk, images
 
 
 def convert_anthropic_to_genspec(
     req: AnthropicMessagesRequest,
     model_sampling: dict[str, Any],
     reasoning_parser: str | None = None,
+    allow_remote_images: bool = False,
 ) -> GenSpec:
-    messages, template_tools, parser_tools, ctk = convert_anthropic_prompt(
-        req, reasoning_parser=reasoning_parser
+    messages, template_tools, parser_tools, ctk, images = convert_anthropic_prompt(
+        req, reasoning_parser=reasoning_parser, allow_remote_images=allow_remote_images
     )
     return GenSpec(
         messages=messages,
+        images=images,
         sampling_params=resolve_sampling(
             temperature=req.temperature,
             top_k=req.top_k,

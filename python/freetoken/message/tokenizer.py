@@ -72,6 +72,10 @@ class TokenizeMsg(BaseTokenizerMsg):
     sampling_params: SamplingParams
     chat_template_kwargs: Dict[str, Any] | None = None
     tools: List[Dict[str, Any]] | None = None
+    # Encoded image bytes (PNG/JPEG/... as the client sent them), in the document order of the
+    # `{"type": "image"}` markers in `text`. The adapters decode the wire payload; the worker's
+    # processor opens and preprocesses them. None/empty = a text-only request, the common path.
+    images: List[bytes] | None = None
 
 
 @dataclass

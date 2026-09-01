@@ -10,6 +10,7 @@ from freetoken.message import (
     BaseBackendMsg,
     BaseTokenizerMsg,
     DetokenizeMsg,
+    ErrorReplyMsg,
     PromptAdmittedMsg,
     UserMsg,
 )
@@ -97,6 +98,12 @@ class LLM(Scheduler):
                 # PromptAdmittedMsg feeds the online server's global accounting. Offline
                 # generation already owns its inputs and has no FrontendManager stats sink.
                 continue
+            if isinstance(msg, ErrorReplyMsg):
+                # The scheduler refuses a request the offline caller built itself (today: a
+                # multimodal prompt over the prefill budget). There is no client to answer, so
+                # it becomes the caller's exception -- never a request that silently never
+                # finishes.
+                raise ValueError(f"request {msg.uid} was rejected by the scheduler: {msg.error}")
             assert isinstance(msg, DetokenizeMsg)
             status = self.status_map[msg.uid]
             if not (msg.finished and msg.next_token in self.eos_token_ids):

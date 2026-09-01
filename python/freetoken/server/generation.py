@@ -23,6 +23,11 @@ from typing import Any
 from . import request_ring
 from freetoken.core import SamplingParams
 from freetoken.message import TokenizeMsg
+from freetoken.multimodal import (
+    decode_anthropic_source,
+    decode_image_url,
+    prompt_too_long_message,
+)
 from freetoken.tokenizer.tokenize import resolve_thinking_mode
 
 try:
@@ -139,6 +144,10 @@ class GenSpec:
     chat_template_kwargs: dict[str, Any] = field(default_factory=dict)
     template_tools: list[dict[str, Any]] | None = None   # tools the model sees (TokenizeMsg.tools)
     parser_tools: list[dict[str, Any]] | None = None     # tools for FunctionCallParser; None disables parsing
+    # Encoded image bytes, in the document order of the ``{"type": "image"}`` markers left in
+    # ``messages``. They travel beside the conversation, not inside it, so the prompt stays
+    # JSON-shaped all the way to the tokenizer worker, which owns the processor.
+    images: list[bytes] = field(default_factory=list)
 
     @property
     def parse_tools(self) -> bool:
@@ -190,15 +199,45 @@ def resolve_sampling(
 def render_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Normalize OpenAI-shaped message dicts for the chat template: flatten text
     content parts to a string and decode tool-call arguments from JSON. Raises
-    ValueError on a non-text content part (text-only server). Shared by all adapters."""
-    return [_render_message(m) for m in messages]
+    ValueError on a non-text content part -- including an image, because a caller that did
+    not ask for images has no way to carry one. Use ``render_messages_multimodal`` on a
+    surface that accepts pictures."""
+    return [_render_message(m, None, False) for m in messages]
 
 
-def _render_message(message: dict[str, Any]) -> dict[str, Any]:
+def allow_remote_images(state: Any) -> bool:
+    """Whether this server fetches client-supplied http(s) image URLs (--allow-remote-images).
+
+    Off unless the operator turned it on; read through one function so no adapter can drift
+    into a different default. See ``multimodal.check_remote_url`` for what the flag still
+    refuses even when on.
+    """
+    return bool(getattr(getattr(state, "config", None), "allow_remote_images", False))
+
+
+def render_messages_multimodal(
+    messages: list[dict[str, Any]], *, allow_remote: bool = False
+) -> tuple[list[dict[str, Any]], list[bytes]]:
+    """``render_messages``, but image parts survive as ``{"type": "image"}`` markers and
+    their decoded bytes come back alongside, in document order.
+
+    The two halves are matched by POSITION, so nothing here may reorder or drop a part: the
+    processor re-attaches image *i* to marker *i*. A part this server cannot serve raises
+    ``ValueError`` -- an adapter turns that into a 4xx, and never a 200 with the picture
+    quietly missing.
+    """
+    images: list[bytes] = []
+    rendered = [_render_message(m, images, allow_remote) for m in messages]
+    return rendered, images
+
+
+def _render_message(
+    message: dict[str, Any], image_sink: list[bytes] | None, allow_remote: bool
+) -> dict[str, Any]:
     m = dict(message)
     content = m.get("content")
     if isinstance(content, list):
-        m["content"] = _flatten_text_parts(content)
+        m["content"] = _render_parts(content, image_sink, allow_remote)
     # Templates read different reasoning keys (reasoning_content: most; reasoning:
     # gemma4; thinking: gpt-oss) — accept any, emit both.
     reasoning = m.get("reasoning_content") or m.get("reasoning") or m.get("thinking")
@@ -230,14 +269,48 @@ def _render_message(message: dict[str, Any]) -> dict[str, Any]:
     return m
 
 
-def _flatten_text_parts(parts: list[Any]) -> str:
+def _render_parts(
+    parts: list[Any], image_sink: list[bytes] | None, allow_remote: bool
+) -> str | list[dict[str, Any]]:
+    """Content parts -> what the chat template should see.
+
+    Two return shapes, deliberately. A text-only message collapses to a plain string, exactly
+    as it always has -- that is the common path and it must stay byte-identical. A message
+    carrying an image keeps the list form, with each picture reduced to a bare
+    ``{"type": "image"}`` marker.
+
+    ``image_sink`` is an out-parameter: the decoded bytes are appended to it in document order
+    so the caller can collect one flat list across every message (the processor matches image
+    *i* to marker *i*). ``None`` means this surface does not accept images at all.
+    """
     texts: list[str] = []
+    out: list[dict[str, Any]] = []
+    saw_image = False
     for part in parts:
         ptype = part.get("type") if isinstance(part, dict) else None
         if ptype == "text":
-            texts.append((part.get("text") if isinstance(part, dict) else None) or "")
-        else:
-            raise ValueError(f"Unsupported content part type for text-only server: {ptype}")
+            text = (part.get("text") if isinstance(part, dict) else None) or ""
+            texts.append(text)
+            out.append({"type": "text", "text": text})
+            continue
+        if ptype in ("image_url", "image") and image_sink is not None:
+            # Two spellings reach here: OpenAI's `image_url` and the marker the Anthropic
+            # converter emits (which carries the Messages-API `source` object verbatim).
+            if "source" in part:
+                image_sink.append(
+                    decode_anthropic_source(part.get("source"), allow_remote=allow_remote)
+                )
+            else:
+                url = part.get("image_url")
+                if isinstance(url, dict):
+                    url = url.get("url")
+                image_sink.append(decode_image_url(url, allow_remote=allow_remote))
+            out.append({"type": "image"})
+            saw_image = True
+            continue
+        raise ValueError(f"Unsupported content part type for this server: {ptype}")
+    if saw_image:
+        return out
     return "".join(texts)
 
 
@@ -269,6 +342,7 @@ async def submit_generation(spec: GenSpec, state: Any) -> int:
             sampling_params=spec.sampling_params,
             chat_template_kwargs=spec.chat_template_kwargs,
             tools=spec.template_tools,
+            images=spec.images or None,
         )
     )
     return uid
@@ -279,6 +353,7 @@ async def count_prompt_tokens(
     tools: list[dict[str, Any]] | None,
     chat_template_kwargs: dict[str, Any],
     state: Any,
+    images: list[bytes] | None = None,
 ) -> int:
     """Token count of an already-converted (messages, tools, chat_template_kwargs) prompt,
     using the frontend's own tokenizer (``state.frontend_tokenizer()``) so the count equals the
@@ -298,6 +373,10 @@ async def count_prompt_tokens(
         sampling_params=SamplingParams(),
         chat_template_kwargs=chat_template_kwargs,
         tools=tools,
+        # The count is exact for an image prompt too: the same processor that will expand the
+        # placeholder run at generation time expands it here, so a client budgeting against
+        # /v1/messages/count_tokens is not surprised by the picture's soft-token cost.
+        images=images or None,
     )
     manager = await asyncio.to_thread(state.frontend_tokenizer)  # init failure -> server fault
     try:
@@ -325,16 +404,47 @@ async def prerender_error(spec: GenSpec, state: Any) -> GenerationError | None:
         sampling_params=SamplingParams(),
         chat_template_kwargs=spec.chat_template_kwargs,
         tools=spec.template_tools,
+        images=spec.images or None,
     )
     try:
         manager = await asyncio.to_thread(build)
     except Exception:  # noqa: BLE001 -- server fault, not this request's problem
         return None
+    if not spec.images:
+        try:
+            await asyncio.to_thread(manager.render_prompt, msg)
+        except Exception as exc:  # noqa: BLE001 -- mirror the worker's classification
+            return GenerationError(f"could not encode request: {exc}")
+        return None
+    # An image request is encoded in full here, not merely rendered: opening the picture is
+    # where a malformed payload is caught, and the expanded length is what the prompt ceiling
+    # is measured against. Both must be a 4xx, and the scheduler's copy of each check would
+    # arrive after the stream's headers.
     try:
-        await asyncio.to_thread(manager.render_prompt, msg)
+        encoded = await asyncio.to_thread(manager.encode, msg)
     except Exception as exc:  # noqa: BLE001 -- mirror the worker's classification
         return GenerationError(f"could not encode request: {exc}")
+    limit = _multimodal_prompt_limit(state)
+    input_len = int(encoded.input_ids.numel())
+    if limit is not None and input_len > limit:
+        return GenerationError(
+            prompt_too_long_message(input_len, limit), code="context_length_exceeded"
+        )
     return None
+
+
+def _multimodal_prompt_limit(state: Any) -> int | None:
+    """The frontend's view of the image-prompt ceiling, or None if it cannot see one.
+
+    Advisory. The frontend knows ``max_extend_tokens`` and the operator's cap, not the live
+    prefill budget the scheduler measures against, and the live budget is never larger -- so
+    this never falsely rejects. It can be too permissive, though, on a model whose cache caps
+    the prefill chunk below ``max_extend_tokens``: there a prompt between the two passes here
+    and is refused by the scheduler once the stream has started. Setting
+    ``--max-multimodal-prompt-tokens`` at or below that cap makes the pre-check exact.
+    """
+    limit = getattr(getattr(state, "config", None), "multimodal_prompt_limit", None)
+    return limit() if callable(limit) else None
 
 
 def _make_reasoning_parser(spec: GenSpec, state: Any) -> ReasoningParser | None:

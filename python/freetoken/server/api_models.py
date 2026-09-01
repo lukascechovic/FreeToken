@@ -6,10 +6,29 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
+class ImageURL(BaseModel):
+    """OpenAI's ``image_url`` part. ``url`` is a ``data:`` URL or bare base64; a remote
+    ``http(s)`` URL is only fetched when the server was started with --allow-remote-images.
+    ``detail`` is accepted and ignored -- this server's processor picks its own resolution."""
+
+    url: str
+    detail: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_bare_url(cls, value: Any) -> Any:
+        # Some clients send `"image_url": "data:image/png;base64,..."` instead of the object
+        # the OpenAI schema documents. The field used to be `Any`, so that spelling reached
+        # the server; typing it must not turn a request that worked into a 422.
+        return {"url": value} if isinstance(value, str) else value
+
+
 class MessageContent(BaseModel):
     type: str
     text: str | None = None
-    image_url: Any | None = None
+    # Typed, not `Any`: it used to be declared and never read, which is how an image could
+    # reach the server and vanish. Pydantic now rejects a malformed part with a 422 instead.
+    image_url: ImageURL | None = None
     audio_url: Any | None = None
 
 

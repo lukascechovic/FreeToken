@@ -32,10 +32,15 @@ def serialize_type(self) -> Dict:
     serialized = {}
 
     if isinstance(self, torch.Tensor):
-        assert self.dim() == 1, "we can only serialize 1D tensor for now"
+        # Prompts are 1-D; multimodal pixel/position batches are [N, P, D] and [N, P, 2], so
+        # the shape rides along and the decoder restores it. A 1-D tensor round-trips
+        # unchanged, and a message written before `shape` existed still decodes (the reader
+        # treats a missing shape as "already the right one").
+        assert not self.is_cuda, "only CPU tensors cross the message wire"
         serialized["__type__"] = "Tensor"
-        serialized["buffer"] = self.numpy().tobytes()
+        serialized["buffer"] = self.contiguous().numpy().tobytes()
         serialized["dtype"] = str(self.dtype)
+        serialized["shape"] = list(self.shape)
         return serialized
 
     # normal type
@@ -71,7 +76,11 @@ def deserialize_type(cls_map: Dict[str, Type], data: Dict) -> Any:
         np_dtype = getattr(np, dtype_str)
         assert isinstance(buffer, bytes)
         np_tensor = np.frombuffer(buffer, dtype=np_dtype)
-        return torch.from_numpy(np_tensor.copy())
+        tensor = torch.from_numpy(np_tensor.copy())
+        shape = data.get("shape")
+        if shape is not None and list(shape) != list(tensor.shape):
+            tensor = tensor.reshape(tuple(int(dim) for dim in shape))
+        return tensor
 
     cls = cls_map.get(type_name)
     if cls is None:

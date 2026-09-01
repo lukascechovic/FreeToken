@@ -758,7 +758,7 @@ def test_count_tokens_image_only_message_400():
 
 def test_tool_choice_none_hides_tools():
     body = {**_COUNT_BODY, "tool_choice": {"type": "none"}}
-    _, template_tools, parser_tools, _ = A.convert_anthropic_prompt(
+    _, template_tools, parser_tools, _, _ = A.convert_anthropic_prompt(
         A.AnthropicCountTokensRequest.model_validate(body)
     )
     assert template_tools is None

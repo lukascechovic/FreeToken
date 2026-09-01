@@ -35,8 +35,15 @@ class UserMsg(BaseBackendMsg):
     input_ids: torch.Tensor  # CPU 1D int32 tensor
     sampling_params: SamplingParams
     # Optional precomputed multimodal soft-token embeddings (GPU tensor). Only used by
-    # the in-process offline path; remains None for the (serialized) online path.
+    # the in-process offline path; the online path leaves it None and sends the pixels below.
     mm_embeds: torch.Tensor | None = None
+    # The online multimodal path. A GPU tensor cannot cross the wire, and the vision tower lives
+    # with the model, so the tokenizer worker sends the *preprocessed pixels* and the scheduler
+    # runs `encode_images` on admission. CPU, [N, P, D] float32 and [N, P, 2] int64 with
+    # (-1, -1) right-padding -- the contract `Qwen4ExpVisionModel.forward` reads. The prompt
+    # ceiling in `Scheduler._multimodal_ceiling_error` binds whichever field carries an image.
+    pixel_values: torch.Tensor | None = None
+    image_position_ids: torch.Tensor | None = None
 
 
 @dataclass

@@ -39,6 +39,10 @@ class ServerArgs(SchedulerConfig):
     # Comma-separated CORS allow-list for browser/webview clients (e.g. the desktop
     # app). Empty string disables CORS headers entirely; "*" allows any origin.
     cors_origins: str = "tauri://localhost,http://tauri.localhost,http://localhost:1420"
+    # Fetch a client-supplied http(s) image URL. Default OFF: this server binds to loopback
+    # behind a proxy, so fetching an arbitrary URL on a client's behalf would make it an SSRF
+    # pivot into whatever else the box serves. data: URLs and base64 need no network.
+    allow_remote_images: bool = False
     # --gpu entries in TP-rank order, empty = not given
     gpu: tuple[str, ...] = ()
     # full UUIDs resolved from --gpu, entry i = TP rank i; None = NVML unavailable, each worker then resolves its raw entry against CUDA's own enumeration
@@ -331,6 +335,31 @@ def parse_args(
         dest="max_extend_tokens",
         default=ServerArgs.max_extend_tokens,
         help="Chunk Prefill maximum chunk size in tokens.",
+    )
+
+    parser.add_argument(
+        "--max-multimodal-prompt-tokens",
+        type=_positive_int,
+        default=ServerArgs.max_multimodal_prompt_tokens,
+        help=(
+            "Longest prompt accepted WITH an image, in tokens. An image prompt must fit one "
+            "prefill chunk, so the effective ceiling is this or --max-prefill-length, "
+            "whichever is lower; a longer prompt is refused with a 400. Set it at or below "
+            "the prefill chunk size to have that 400 raised before a stream starts. Default: "
+            "the prefill chunk size."
+        ),
+    )
+
+    parser.add_argument(
+        "--allow-remote-images",
+        action="store_true",
+        default=ServerArgs.allow_remote_images,
+        help=(
+            "Fetch http(s) image URLs supplied by clients. OFF by default: this server binds "
+            "to loopback, so fetching client URLs makes it an SSRF pivot. Even when on, only "
+            "http(s) URLs resolving to public addresses are fetched. data: URLs and bare "
+            "base64 always work."
+        ),
     )
 
     parser.add_argument(

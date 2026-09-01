@@ -24,6 +24,7 @@ from freetoken.message import (
     UserMsg,
     UserReply,
 )
+from freetoken.multimodal import EncodedPrompt
 from freetoken.utils import (
     ZmqPullQueue,
     ZmqPushQueue,
@@ -84,18 +85,24 @@ def _tokenize_requests(
     tokenize_manager: Any,
     messages: List[TokenizeMsg],
     logger: Any,
-) -> tuple[List[TokenizeMsg], List[torch.Tensor], List[UserReply]]:
-    """Tokenize independently, returning backend work plus terminal frontend errors.
+) -> tuple[List[TokenizeMsg], List[EncodedPrompt], List[UserReply]]:
+    """Encode independently, returning backend work plus terminal frontend errors.
 
-    Successful tokenization deliberately emits no prompt-token reply: accounting starts
-    only when the scheduler later confirms first-prefill admission.
+    Each element of the middle list is an ``EncodedPrompt``: the token ids, plus the
+    preprocessed pixels when the request carried images. Successful tokenization
+    deliberately emits no prompt-token reply: accounting starts only when the scheduler
+    later confirms first-prefill admission.
+
+    An unservable image lands here as an ``ImageError`` (a ``ValueError``) and becomes THIS
+    uid's terminal error, exactly like an un-renderable chat template -- never a dropped
+    image on a 200, and never a dead worker.
     """
     ok_msgs: List[TokenizeMsg] = []
-    ok_tensors: List[torch.Tensor] = []
+    ok_encoded: List[EncodedPrompt] = []
     errors: List[UserReply] = []
     for msg in messages:
         try:
-            tokens = tokenize_manager.tokenize([msg])[0]
+            encoded = tokenize_manager.encode(msg)
         except Exception as exc:  # noqa: BLE001 — isolate, never crash the worker
             logger.warning(f"tokenization failed for request {msg.uid}: {exc!r}")
             errors.append(
@@ -109,7 +116,7 @@ def _tokenize_requests(
             continue
         # A zero-token prompt would trip the scheduler's input_len > 0 invariant and
         # crash the worker; reject it here as a terminal error instead.
-        if tokens.numel() == 0:
+        if encoded.input_ids.numel() == 0:
             errors.append(
                 UserReply(
                     uid=msg.uid,
@@ -120,8 +127,8 @@ def _tokenize_requests(
             )
             continue
         ok_msgs.append(msg)
-        ok_tensors.append(tokens)
-    return ok_msgs, ok_tensors, errors
+        ok_encoded.append(encoded)
+    return ok_msgs, ok_encoded, errors
 
 
 @torch.inference_mode()
@@ -245,7 +252,7 @@ def tokenize_worker(
                 # Tokenize per-message so a single un-renderable request (e.g. a chat template
                 # that rejects the message layout) becomes a terminal error reply for THAT uid
                 # instead of an uncaught exception that kills the worker and bricks the server.
-                ok_msgs, ok_tensors, errors = _tokenize_requests(
+                ok_msgs, ok_encoded, errors = _tokenize_requests(
                     tokenize_manager, tokenize_msg, logger
                 )
                 if errors:
@@ -253,9 +260,18 @@ def tokenize_worker(
                         errors[0] if len(errors) == 1 else BatchFrontendMsg(data=errors)
                     )
                 if ok_msgs:
+                    # The pixels ride to the scheduler, not the soft-token embeddings: the
+                    # vision tower lives with the model, on the device this process cannot
+                    # touch. Both fields stay None on the text path.
                     backend = [
-                        UserMsg(uid=msg.uid, input_ids=t, sampling_params=msg.sampling_params)
-                        for msg, t in zip(ok_msgs, ok_tensors, strict=True)
+                        UserMsg(
+                            uid=msg.uid,
+                            input_ids=e.input_ids,
+                            sampling_params=msg.sampling_params,
+                            pixel_values=e.pixel_values,
+                            image_position_ids=e.image_position_ids,
+                        )
+                        for msg, e in zip(ok_msgs, ok_encoded, strict=True)
                     ]
                     send_backend.put(backend[0] if len(backend) == 1 else BatchBackendMsg(data=backend))
             if len(abort_msg) > 0:

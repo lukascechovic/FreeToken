@@ -32,9 +32,10 @@ from .generation import (
     ToolCallsDelta,
     ToolCallStart,
     generate_events,
+    allow_remote_images,
     generate_full,
     prerender_error,
-    render_messages,
+    render_messages_multimodal,
     resolve_sampling,
     submit_generation,
 )
@@ -58,16 +59,25 @@ def _thinking_type(req: Any) -> str | None:
 def chat_request_to_genspec(
     req: ChatCompletionRequest,
     model_sampling: dict[str, Any],
+    allow_remote_images: bool = False,
 ) -> GenSpec:
-    """OpenAI ChatCompletionRequest -> GenSpec (the OpenAI 'to_sampling_params')."""
+    """OpenAI ChatCompletionRequest -> GenSpec (the OpenAI 'to_sampling_params').
+
+    An undecodable image raises ``ValueError`` here, which the handler already turns into a
+    clean 400 -- the same class as any other bad request field."""
     from .model_meta import effort_toggle_kwargs
 
     ctk = req.chat_template_kwargs
     thinking_type = _thinking_type(req)
     if req.reasoning_effort or thinking_type:
         ctk = effort_toggle_kwargs(req.reasoning_effort, ctk, thinking_type=thinking_type)
+    messages, images = render_messages_multimodal(
+        [m.model_dump(exclude_none=True) for m in req.messages],
+        allow_remote=allow_remote_images,
+    )
     return GenSpec(
-        messages=render_messages([m.model_dump(exclude_none=True) for m in req.messages]),
+        messages=messages,
+        images=images,
         sampling_params=resolve_sampling(
             temperature=req.temperature,
             top_k=req.top_k,
@@ -179,13 +189,15 @@ async def handle_chat_completion(
             )
 
     try:
-        spec = chat_request_to_genspec(req, model_sampling)
+        spec = chat_request_to_genspec(req, model_sampling, allow_remote_images(state))
     except ValueError as exc:
         return create_error_response(str(exc))
 
-    if req.stream:
-        # Non-stream requests already surface render failures as a clean 400
-        # through GenerationError; only the stream path needs the pre-check.
+    if req.stream or spec.images:
+        # Non-stream requests already surface render failures as a clean 400 through
+        # GenerationError; only the stream path needs the pre-check. An image request takes it
+        # either way: opening the picture is the check, and doing it here keeps a bad image off
+        # the engine entirely.
         err = await prerender_error(spec, state)
         if err is not None:
             return create_error_response(str(err), code=err.code)

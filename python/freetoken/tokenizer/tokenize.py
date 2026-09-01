@@ -9,6 +9,7 @@ from typing import Any, List
 
 import torch
 from freetoken.message import TokenizeMsg
+from freetoken.multimodal import EncodedPrompt, ImageError, MultimodalProcessor
 from freetoken.utils import init_logger
 from transformers import PreTrainedTokenizerBase
 
@@ -54,25 +55,86 @@ class TokenizeManager:
         self._thinking_profile: ThinkingProfile | None = None
         self._effort_lock = threading.Lock()
         self._logged_effort_maps: set[tuple[Any, str | None]] = set()
+        # The HF processor is built on first image, never for a text-only server: loading it
+        # reads the checkpoint's preprocessor_config.json and pulls in PIL.
+        self._mm_processor: MultimodalProcessor | None = None
+        self._mm_error: Exception | None = None
+        self._mm_lock = threading.Lock()
 
     def tokenize(self, msgs: List[TokenizeMsg]) -> List[torch.Tensor]:
-        results: List[torch.Tensor] = []
         # TODO: batch tokenization
-        for msg in msgs:
-            prompt = self.render_prompt(msg)
-            # A jinja chat template owns every special token (HF's apply_chat_template
-            # tokenizes with add_special_tokens=False for the same reason): tokenizers
-            # that auto-add bos (muse-glimmer's, llama's) would otherwise double it --
-            # the template already rendered one. Raw-string prompts and the dsv4
-            # encoder path keep the default.
-            templated = isinstance(msg.text, list) and self._dsv4_encoder is None
-            input_ids: torch.Tensor = (  # type: ignore
-                self.tokenizer.encode(
-                    prompt, return_tensors="pt", add_special_tokens=not templated
-                )
+        return [self.encode(msg).input_ids for msg in msgs]
+
+    def encode(self, msg: TokenizeMsg) -> EncodedPrompt:
+        """Tokenize one request, preprocessing its images when it carries any.
+
+        The single encode entry point. A request with no images takes the byte-identical text
+        path it always took -- the processor is never built and never consulted, because this
+        code runs on every request of a deployed text row.
+        """
+        if not msg.images:
+            return EncodedPrompt(self._tokenize_text(msg))
+        return self._encode_multimodal(msg)
+
+    def _tokenize_text(self, msg: TokenizeMsg) -> torch.Tensor:
+        prompt = self.render_prompt(msg)
+        # A jinja chat template owns every special token (HF's apply_chat_template
+        # tokenizes with add_special_tokens=False for the same reason): tokenizers
+        # that auto-add bos (muse-glimmer's, llama's) would otherwise double it --
+        # the template already rendered one. Raw-string prompts and the dsv4
+        # encoder path keep the default.
+        templated = isinstance(msg.text, list) and self._dsv4_encoder is None
+        input_ids: torch.Tensor = (  # type: ignore
+            self.tokenizer.encode(
+                prompt, return_tensors="pt", add_special_tokens=not templated
             )
-            results.append(input_ids.view(-1).to(torch.int32))
-        return results
+        )
+        return input_ids.view(-1).to(torch.int32)
+
+    def _encode_multimodal(self, msg: TokenizeMsg) -> EncodedPrompt:
+        """Render + tokenize + preprocess in ONE processor call.
+
+        The checkpoint's own template emits the ``<|image_pad|>`` run and the processor
+        expands it to that image's soft-token count, so the placeholder arithmetic that
+        ``_merge_multimodal`` asserts on is never done by hand here -- only checked.
+        """
+        if not isinstance(msg.text, list):
+            raise ImageError("images require a chat request; a raw prompt string cannot carry one")
+        if self._dsv4_encoder is not None:
+            raise ImageError("this checkpoint's chat encoder is text-only and cannot accept images")
+        kwargs = self._template_kwargs(self._sanitize_effort(msg.chat_template_kwargs or {}), msg.tools)
+        return self.multimodal_processor().encode_chat(msg.text, msg.images, kwargs)
+
+    def multimodal_processor(self) -> MultimodalProcessor:
+        """The checkpoint's HF processor, built once per process on the first image.
+
+        A checkpoint with no image processor is a *client* error here (this row does not
+        serve images), not a server fault -- so the failure is cached and re-raised as an
+        ``ImageError``, which every adapter already turns into a 4xx.
+        """
+        with self._mm_lock:
+            if self._mm_processor is not None:
+                return self._mm_processor
+            if self._mm_error is not None:
+                raise self._mm_error
+            model_path = str(
+                getattr(self.tokenizer, "name_or_path", None)
+                or getattr(self.tokenizer, "_name_or_path", "")
+            )
+            try:
+                if not model_path:
+                    raise RuntimeError("the tokenizer does not know its checkpoint path")
+                self._mm_processor = MultimodalProcessor(model_path)
+            except Exception as exc:  # noqa: BLE001 -- "this row is text-only" is a 4xx
+                self._mm_error = ImageError(f"this server does not accept images: {exc}")
+                raise self._mm_error from exc
+            logger.info(
+                "image ingest ready: %s (merge=%d, image_token_id=%d)",
+                type(self._mm_processor.processor).__name__,
+                self._mm_processor.merge_size,
+                self._mm_processor.image_token_id,
+            )
+            return self._mm_processor
 
     def render_prompt(self, msg: TokenizeMsg) -> str:
         """The template/encoder half of ``tokenize``, exposed so the frontend can
@@ -97,10 +159,26 @@ class TokenizeManager:
             return _apply_dsv4_chat_encoder(
                 self._dsv4_encoder, messages, tools, chat_template_kwargs
             )
-        # Broadcast the effort in every spelling the ecosystem's templates read
-        # (muse-glimmer grades ``reasoning_strength``; Jinja ignores undeclared
-        # variables) -- the same rule the thinking toggles use. An explicit
-        # caller-provided spelling wins over the broadcast.
+        prompt = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            **self._template_kwargs(chat_template_kwargs, tools),
+        )
+        assert isinstance(prompt, str)
+        return prompt
+
+    def _template_kwargs(
+        self, chat_template_kwargs: dict[str, Any], tools: list[dict[str, Any]] | None
+    ) -> dict[str, Any]:
+        """The kwargs a chat template is rendered with. Shared by the text path and the
+        image path so a prompt renders identically whichever one carries it.
+
+        Broadcast the effort in every spelling the ecosystem's templates read
+        (muse-glimmer grades ``reasoning_strength``; Jinja ignores undeclared
+        variables) -- the same rule the thinking toggles use. An explicit
+        caller-provided spelling wins over the broadcast.
+        """
         if "reasoning_effort" in chat_template_kwargs:
             chat_template_kwargs = dict(chat_template_kwargs)
             chat_template_kwargs.setdefault(
@@ -108,14 +186,7 @@ class TokenizeManager:
             )
         if tools is not None:
             chat_template_kwargs = {**chat_template_kwargs, "tools": tools}
-        prompt = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            **chat_template_kwargs,
-        )
-        assert isinstance(prompt, str)
-        return prompt
+        return chat_template_kwargs
 
     def effort_profile(self) -> EffortProfile:
         """The checkpoint's effort vocabulary, probed on first use and cached

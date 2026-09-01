@@ -47,6 +47,10 @@ class PrefillAdder:
     # allocated only in allocate_paged (after the pass), so swa_available_size does not decrement
     # across the admission loop -- without this, successive admits all see the full pool.
     reserved_swa: int = 0
+    # This pass's STARTING budget, before admissions decrement token_budget. A multimodal prompt
+    # longer than this can never fit any pass, which is what separates "wait for room" from
+    # "this will spin forever" in _add_one_req.
+    full_token_budget: int = 0
 
     def _try_allocate_one(self, req: PendingReq):
         if self.table_manager.available_size == 0:
@@ -124,6 +128,7 @@ class PrefillAdder:
     ) -> Req | None:
         remain_len = pending_req.input_len - cached_len
         chunk_size = min(self.token_budget, remain_len)
+        swa_charged = 0  # this pass's swa reservation, undone if the request bails below
         if self.cache_manager.swa_paged:
             # Cap this chunk by the swa the pool can back this pass. swa is allocated per token in
             # allocate_paged, and token_budget (max_extend_tokens, default 8192) won't chunk a
@@ -153,9 +158,10 @@ class PrefillAdder:
                 if aligned <= 0:
                     return None
                 chunk_size = aligned
-            self.reserved_swa += (
+            swa_charged = (
                 div_ceil(cached_len + chunk_size, ps) - div_ceil(cached_len, ps)
             ) * ps
+            self.reserved_swa += swa_charged
         align = self.cache_manager.prefill_chunk_align
         if align > 1 and 0 < chunk_size < remain_len:
             # An unaligned chunk end is correct, it just loses this prompt's snapshot boundaries --
@@ -164,6 +170,29 @@ class PrefillAdder:
             aligned = align_down(cached_len + chunk_size, align) - cached_len
             chunk_size = aligned if aligned > 0 else chunk_size
         is_chunked = chunk_size < remain_len
+        if is_chunked and pending_req.mm_embeds is not None:
+            # A multimodal prompt cannot be split across chunks -- its soft tokens are scattered
+            # into the hidden states in a single pass. Two different situations reach here and
+            # they must not share an outcome:
+            #
+            #   * the prompt fits a full pass, but in-flight decode has eaten this pass's share
+            #     -> wait for a pass with room (the common case; admission already sized it);
+            #   * the prompt is longer than a full pass -> no pass will ever seat it, so
+            #     deferring would spin forever. Fail loudly instead, as this did before the
+            #     deferral existed.
+            #
+            # The second branch is the backstop that keeps the deferral honest on its own:
+            # `Scheduler._attach_mm_embeds` refuses an over-ceiling prompt at admission, but the
+            # budget can also shrink under an already-pending request (`rebuild_cache`), and the
+            # in-process offline path builds a UserMsg the scheduler's check cannot resize.
+            self.reserved_swa -= swa_charged
+            if remain_len > self.full_token_budget:
+                raise NotImplementedError(
+                    f"Multimodal prompts must fit in a single prefill chunk: {remain_len} tokens "
+                    f"> {self.full_token_budget} budget. Increase --max-extend-tokens or shrink "
+                    f"the prompt."
+                )
+            return None
         CLS = ChunkedReq if is_chunked else Req
         self.token_budget -= chunk_size
         self.reserved_size += remain_len + pending_req.output_len
@@ -171,11 +200,6 @@ class PrefillAdder:
         _slice = slice(cached_len, cached_len + chunk_size)
         device_ids = self.table_manager.token_pool[table_idx, _slice]
         device_ids.copy_(_maybe_pinned(pending_req.input_ids[_slice]), non_blocking=True)
-        if is_chunked and pending_req.mm_embeds is not None:
-            raise NotImplementedError(
-                "Multimodal prompts must fit in a single prefill chunk; increase "
-                "--max-extend-tokens or shrink the prompt."
-            )
         req = CLS(
             input_ids=pending_req.input_ids[: cached_len + chunk_size],
             table_idx=table_idx,
@@ -255,6 +279,7 @@ class PrefillManager:
         # estimated offset due to in-flight decode
         adder = PrefillAdder(
             token_budget=prefill_budget,
+            full_token_budget=prefill_budget,
             reserved_size=self.decode_manager.inflight_tokens,
             cache_manager=self.cache_manager,
             table_manager=self.table_manager,

@@ -19,6 +19,7 @@ from freetoken.message import (
     PromptAdmittedMsg,
     UserMsg,
 )
+from freetoken.multimodal import prompt_too_long_message
 from freetoken.utils import (
     init_logger,
     load_eos_token_ids,
@@ -474,6 +475,57 @@ class Scheduler(SchedulerIOMixin):
             return 0
         return torch.cuda.memory_reserved(self.device)
 
+    def _multimodal_ceiling_error(self, msg: UserMsg) -> ErrorReplyMsg | None:
+        """Refuse an image prompt that no prefill pass can seat. The authoritative check.
+
+        ``PrefillAdder`` cannot split a multimodal prompt across chunks -- its soft tokens are
+        scattered into the hidden states in one pass -- so a prompt over the budget would wait
+        for a pass that never comes. Naming it here makes it the client's 400.
+
+        Every request carrying vision input passes through here, whether it arrived as pixels
+        from the tokenizer worker or as embeddings the in-process offline API attached itself:
+        the deferral in ``PrefillAdder`` is only safe while this check has no way around it.
+        """
+        limit = self.config.multimodal_prompt_limit(self.prefill_budget)
+        input_len = len(msg.input_ids)
+        if input_len > limit:
+            return ErrorReplyMsg(
+                uid=msg.uid,
+                error=prompt_too_long_message(input_len, limit),
+                code="context_length_exceeded",
+            )
+        return None
+
+    def _attach_mm_embeds(self, msg: UserMsg) -> ErrorReplyMsg | None:
+        """Run the vision tower for an admitted image prompt; returns the client's error, or None.
+
+        This is where the pixels the tokenizer worker sent become soft-token embeddings, on the
+        device that holds the model. A model with no vision tower is the client's error too:
+        a dropped image returning 200 is the exact failure this whole path exists to end.
+        """
+        encode = getattr(self.engine.model, "encode_images", None)
+        if encode is None:
+            return ErrorReplyMsg(
+                uid=msg.uid,
+                error=(
+                    "this model does not accept images; retry without them "
+                    "(the server was started without a vision tower)"
+                ),
+                code="invalid_request_error",
+            )
+        try:
+            msg.mm_embeds = encode(
+                msg.pixel_values.to(self.device), msg.image_position_ids.to(self.device)
+            )
+        except Exception as exc:  # noqa: BLE001 -- one bad image must not take the engine down
+            logger.warning_rank0("vision encode failed for request %d: %r", msg.uid, exc)
+            return ErrorReplyMsg(
+                uid=msg.uid,
+                error=f"could not encode the image: {exc}",
+                code="invalid_request_error",
+            )
+        return None
+
     def _process_one_msg(self, msg: BaseBackendMsg) -> None:
         if isinstance(msg, BatchBackendMsg):
             for msg in msg.data:
@@ -520,6 +572,14 @@ class Scheduler(SchedulerIOMixin):
                 logger.warning_rank0(
                     f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
                 )
+            if msg.pixel_values is not None or msg.mm_embeds is not None:
+                # The ceiling binds both arrivals; only the pixels still need the tower run.
+                error = self._multimodal_ceiling_error(msg)
+                if error is None and msg.pixel_values is not None:
+                    error = self._attach_mm_embeds(msg)
+                if error is not None:
+                    self.send_result([error])
+                    return
             self.prefill_manager.add_one_req(msg)
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)
