@@ -12,7 +12,76 @@ from freetoken.models.config import (
     ModelConfig,
     RotaryConfig,
     SlotStateSpec,
+    vision_load_enabled,
 )
+
+
+@dataclass(frozen=True)
+class VisionConfig:
+    """Geometry of the ``model.visual.*`` ViT (``models/qwen4_exp/vision.py``).
+
+    Read straight off the checkpoint's ``vision_config``. ⛔ Two values HF does NOT keep there
+    and so neither does this: the LayerNorm epsilon (hardcoded 1e-6 in the modelling code) and
+    the rope theta (the ``Qwen4ExpVisionRotaryEmbedding`` default, 10000.0).
+    """
+
+    hidden_size: int
+    depth: int
+    num_heads: int
+    intermediate_size: int
+    patch_size: int
+    temporal_patch_size: int
+    in_channels: int
+    spatial_merge_size: int
+    num_position_embeddings: int
+    out_hidden_size: int
+    hidden_act: str
+    rope_theta: float
+
+    @property
+    def head_dim(self) -> int:
+        return self.hidden_size // self.num_heads
+
+    @property
+    def patch_input_dim(self) -> int:
+        """Flattened per-patch vector: ``in_channels * temporal_patch_size * patch_size**2``."""
+        return self.in_channels * self.temporal_patch_size * self.patch_size**2
+
+    @property
+    def merged_hidden_size(self) -> int:
+        return self.hidden_size * self.spatial_merge_size**2
+
+    @property
+    def num_grid_per_side(self) -> int:
+        """Side of the square learned position grid the table is resampled from (48 here)."""
+        return int(self.num_position_embeddings**0.5)
+
+
+def _parse_vision_config(hf_config: Any, out_hidden_size: int) -> VisionConfig | None:
+    """The tower is opt-in, exactly as gemma4's is (``FREETOKEN_LOAD_VISION=1``).
+
+    ⛔⛆ Before this existed the switch was inert on this family: ``weight.py``'s ``_rename``
+    dropped every ``model.visual.*`` key unconditionally, *ahead* of any config gate, so
+    setting the variable changed nothing and errored nowhere. Returning ``None`` here is now
+    the single switch -- the model build and the weight reader both flow through it.
+    """
+    vc = getattr(hf_config, "vision_config", None)
+    if vc is None or not vision_load_enabled():
+        return None
+    return VisionConfig(
+        hidden_size=int(vc.hidden_size),
+        depth=int(vc.depth),
+        num_heads=int(vc.num_heads),
+        intermediate_size=int(vc.intermediate_size),
+        patch_size=int(vc.patch_size),
+        temporal_patch_size=int(vc.temporal_patch_size),
+        in_channels=int(vc.in_channels),
+        spatial_merge_size=int(vc.spatial_merge_size),
+        num_position_embeddings=int(vc.num_position_embeddings),
+        out_hidden_size=int(getattr(vc, "out_hidden_size", None) or out_hidden_size),
+        hidden_act=str(getattr(vc, "hidden_act", "gelu_pytorch_tanh")),
+        rope_theta=float(getattr(vc, "rope_theta", 10000.0)),
+    )
 
 
 @dataclass(frozen=True)
@@ -278,7 +347,7 @@ def parse_config(hf_config: Any) -> ModelConfig:
         use_qk_norm=True,
         model_type=getattr(hf_config, "model_type", "qwen4_exp"),
         architectures=getattr(hf_config, "architectures", ["Qwen4ExpForConditionalGeneration"]),
-        vision_config=None,  # served text-only
+        vision_config=_parse_vision_config(hf_config, text.hidden_size),
         image_token_id=getattr(hf_config, "image_token_id", None),
         attention_groups=groups,
         expert_quant=expert_quant,
@@ -290,4 +359,11 @@ def parse_config(hf_config: Any) -> ModelConfig:
     )
 
 
-__all__ = ["PLE_CONV_STATE", "PLE_NGRAM_STATE", "Qwen4ExpArgs", "parse_config", "ple_slot_states"]
+__all__ = [
+    "PLE_CONV_STATE",
+    "PLE_NGRAM_STATE",
+    "Qwen4ExpArgs",
+    "VisionConfig",
+    "parse_config",
+    "ple_slot_states",
+]

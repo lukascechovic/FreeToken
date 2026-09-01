@@ -13,6 +13,7 @@ from .norm import (
     GemmaPlusOneRMSNorm,
     GemmaPlusOneRMSNormFused,
     GemmaRMSNorm,
+    LayerNorm,
     RMSNorm,
     RMSNormFused,
 )
@@ -34,6 +35,7 @@ __all__ = [
     "LinearQKVMerged",
     "RMSNorm",
     "RMSNormFused",
+    "LayerNorm",
     "GemmaRMSNorm",
     "GemmaPlusOneRMSNorm",
     "GemmaPlusOneRMSNormFused",

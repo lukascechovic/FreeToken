@@ -7,7 +7,9 @@ from freetoken.attention.base import AttnType
 
 # State-dict key prefixes for the (optional) vision stack. Used both to drop the vision
 # config (so the tower is never built) and to skip the matching tensors in the FTW reader.
-VISION_KEY_PREFIXES = ("vision_tower.", "embed_vision.")
+# ⚠ One entry per naming convention in play, NOT per family: gemma4 splits the tower from its
+# projector (``vision_tower.`` / ``embed_vision.``), qwen4_exp keeps both under ``visual.``.
+VISION_KEY_PREFIXES = ("vision_tower.", "embed_vision.", "visual.")
 _VISION_TRUE = {"1", "true", "yes", "on"}
 
 

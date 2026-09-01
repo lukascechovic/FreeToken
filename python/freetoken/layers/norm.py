@@ -168,3 +168,28 @@ class RMSNormFused(BaseOP):
             return self.rmsnorm(x, self.weight, self.eps), x
         self.fused_add_rmsnorm(x, residual, self.weight, self.eps)
         return x, residual
+
+
+class LayerNorm(BaseOP):
+    """Standard (mean-subtracting) LayerNorm with an optional bias.
+
+    ``layers/norm.py`` otherwise ships only RMSNorm variants, because every text decoder
+    served here is RMSNorm-based. Qwen4-Exp's vision tower is a vanilla ViT and uses
+    LayerNorm *with* bias in all three places it norms (``blocks.N.norm{1,2}`` and
+    ``merger.norm``), so the primitive has to exist before the tower can be ported.
+
+    Backed by ``F.layer_norm``, which accumulates in fp32 for a bf16 input -- matching HF's
+    ``nn.LayerNorm`` exactly, so a ported tower is comparable against the reference
+    element-wise rather than merely in aggregate.
+    """
+
+    def __init__(self, size: int, eps: float, has_bias: bool = True) -> None:
+        self.size = size
+        self.eps = eps
+        self.weight = torch.empty(size)
+        self.bias = torch.empty(size) if has_bias else None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        import torch.nn.functional as F
+
+        return F.layer_norm(x, (self.size,), self.weight, self.bias, self.eps)

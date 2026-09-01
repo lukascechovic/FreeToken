@@ -89,6 +89,7 @@ class Qwen4ExpDecoderLayer(BaseOP):
 class Qwen4ExpModel(BaseOP):
     def __init__(self, config: ModelConfig) -> None:
         self.hc_count = config.qwen4_args.hc_count
+        self._image_token_id = config.image_token_id
         self.embed_tokens = VocabParallelEmbedding(
             num_embeddings=config.vocab_size,
             embedding_dim=config.hidden_size,
@@ -105,8 +106,27 @@ class Qwen4ExpModel(BaseOP):
         """The PLE layers in decoder order -- the seam the loader attaches table backends to."""
         return list(self._ple)
 
+    def _merge_multimodal(self, input_ids: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        """Scatter precomputed image soft tokens over the ``image_token_id`` placeholders.
+
+        ⚠ Runs on the ``[T, hidden]`` embedding, BEFORE it is repeated across the ``hc_count``
+        hyper-connection streams -- the image features are text-hidden-sized, not stream-sized.
+        Only prefill batches carrying images reach the scatter; decode batches never do.
+        """
+        mm_embeds = getattr(get_global_ctx().batch, "mm_embeds", None)
+        if mm_embeds is None or self._image_token_id is None:
+            return x
+        mask = input_ids == self._image_token_id
+        n_slots = int(mask.sum().item())
+        assert n_slots == mm_embeds.shape[0], (
+            f"image-token slots ({n_slots}) != vision features ({mm_embeds.shape[0]}); "
+            "image tokens must not be split across prefill chunks"
+        )
+        return x.masked_scatter(mask.unsqueeze(-1), mm_embeds.to(x.dtype))
+
     def forward(self, input_ids: torch.Tensor, batch: Batch) -> torch.Tensor:
-        hidden = self.embed_tokens.forward(input_ids).repeat(1, self.hc_count)
+        embedded = self._merge_multimodal(input_ids, self.embed_tokens.forward(input_ids))
+        hidden = embedded.repeat(1, self.hc_count)
         meta = None
         if self._ple:
             from .ple import build_ple_metadata, commit_ngram_context
@@ -127,6 +147,10 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
     def __init__(self, config: ModelConfig) -> None:
         self._config = config
         self.model = Qwen4ExpModel(config)
+        if config.is_multimodal:
+            from .vision import Qwen4ExpVisionModel
+
+            self.visual = Qwen4ExpVisionModel(config.vision_config)
         if getattr(config, "lm_head_quant", "none") == "nvfp4":
             from freetoken.kernel.triton.nvfp4_linear import Nvfp4LMHead
 
@@ -142,6 +166,19 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
             )
         super().__init__()
+
+    @torch.inference_mode()
+    def encode_images(
+        self, pixel_values: torch.Tensor, image_position_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """Run the vision tower. Returns ``[num_soft_tokens, hidden]`` in the text hidden space.
+
+        ``pixel_values``: ``[num_images, num_patches, in_ch*temporal*patch**2]``;
+        ``image_position_ids``: ``[num_images, num_patches, 2]`` with ``(-1, -1)`` padding.
+        ⭐ There is no separate projector op here -- the tower's ``merger`` already lands in the
+        text hidden size, so its output is returned unchanged.
+        """
+        return self.visual.forward(pixel_values, image_position_ids)
 
     def load_host_tables(self, engine_config) -> int:
         """Attach the PLE n-gram table (pinned checkpoint bank, or zeros for dummy weights); returns the pinned host bytes the engine reserves from its pin budget."""

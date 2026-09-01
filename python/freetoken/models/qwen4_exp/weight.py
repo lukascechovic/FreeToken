@@ -6,7 +6,9 @@ Three separate paths, because the checkpoint's three weight classes live in diff
 * :func:`load_ple_table` -- the 47.7 GiB FP8 n-gram table, 128 checkpoint shards concatenated into one pinned :class:`HostBank`.
 * :func:`load_nvfp4_expert_sources` -- the routed NVFP4 experts, into the offload cache's source banks.
 
-Dropped: ``mtp.*`` (speculative head, including its stacked ``mtp.layers.0.mlp.experts.*``) and ``model.visual.*`` (served text-only).
+Dropped: ``mtp.*`` (speculative head, including its stacked ``mtp.layers.0.mlp.experts.*``).
+``model.visual.*`` -- the 333-tensor, 897,862,112 B BF16 vision tower -- is gated on
+``config.is_multimodal`` (i.e. ``FREETOKEN_LOAD_VISION=1``) and dropped when it is off.
 """
 
 from __future__ import annotations
@@ -27,7 +29,7 @@ from freetoken.models.nvfp4_banks import (
     load_nvfp4_expert_source_banks,
 )
 from freetoken.moe.host_banks import HostBank, read_range_into
-from freetoken.utils import download_hf_weight
+from freetoken.utils import cached_load_hf_config, download_hf_weight
 from freetoken.utils.progress import byte_bar
 from tqdm import tqdm
 
@@ -45,6 +47,9 @@ _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
     layer_to_bank=lambda layer, config: layer,  # every layer is MoE
     desc="Qwen3.8-Flash-Next NVFP4 experts",
 )
+# The vision patch embedding is stored as a Conv3d kernel and consumed as a Linear weight.
+_PATCH_EMBED_WEIGHT = "visual.patch_embed.proj.weight"
+
 # Per-tensor modelopt quant scales; consumed with their ``.weight`` (experts) or unused.
 _SCALE_SUFFIXES = (".weight_scale", ".weight_scale_2", ".input_scale")
 
@@ -98,10 +103,18 @@ _FUSIONS: dict[str, tuple[tuple[str, ...], int]] = {
 }
 
 
-def _rename(raw_name: str) -> str | None:
+_VISION_PREFIXES = ("model.visual.", "visual.")
+
+
+def _rename(raw_name: str, *, include_vision: bool) -> str | None:
     """Checkpoint key -> FreeToken state-dict key, or None to skip."""
-    if raw_name.startswith(("mtp.", "model.visual.", "visual.")):
+    if raw_name.startswith("mtp."):
         return None
+    if raw_name.startswith(_VISION_PREFIXES):
+        # ``model.visual.blocks.0.attn.qkv.weight`` -> ``visual.blocks.0.attn.qkv.weight``.
+        return (
+            "visual." + raw_name.split("visual.", 1)[1] if include_vision else None
+        )
     if _PLE_TABLE_INFIX in raw_name:
         return None  # n-gram table + its scale: load_ple_table
     if _EXPERT_RE.search(raw_name):
@@ -162,6 +175,10 @@ def iter_weights(
     if not include_non_moe:
         return
 
+    from .config import parse_config
+
+    include_vision = parse_config(cached_load_hf_config(model_path)).is_multimodal
+
     fuse_buf: dict[str, dict[int, torch.Tensor]] = {}
     for file in tqdm(
         iter_weight_files(model_path),
@@ -170,10 +187,15 @@ def iter_weights(
     ):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             for raw_name in f.keys():
-                name = _rename(raw_name)
+                name = _rename(raw_name, include_vision=include_vision)
                 if name is None:
                     continue
                 tensor = f.get_tensor(raw_name)
+                if name == _PATCH_EMBED_WEIGHT:
+                    # The tower's patch_embed is a Conv3d whose stride equals its kernel, which
+                    # is exactly a Linear over the flattened patch. Fold the reshape into the
+                    # load so the forward never pays it: [H, C, T, P, P] -> [H, C*T*P*P].
+                    tensor = tensor.reshape(tensor.shape[0], -1)
                 fused = _try_fuse(name, tensor, fuse_buf)
                 if fused is not None:
                     if fused != ():  # () means buffered, not yet complete
