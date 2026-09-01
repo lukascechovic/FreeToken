@@ -29,7 +29,7 @@ from freetoken.models.nvfp4_banks import (
     load_nvfp4_expert_source_banks,
 )
 from freetoken.moe.host_banks import HostBank, read_range_into
-from freetoken.utils import cached_load_hf_config, download_hf_weight
+from freetoken.utils import cached_load_hf_config, div_even, download_hf_weight
 from freetoken.utils.progress import byte_bar
 from tqdm import tqdm
 
@@ -170,8 +170,12 @@ def iter_weights(
     ``include_moe_experts`` is accepted for the loader contract but never yields anything: the
     routed experts are NVFP4 and always come from :func:`load_nvfp4_expert_sources`.
     """
-    if get_tp_info().size > 1:
-        raise NotImplementedError("qwen4_exp weight loading supports TP=1 only")
+    # ⭐ TP (llm-server #725): every dense weight here stays REPLICATED. The tensor-parallel axis
+    # for this model is the MoE experts' intermediate dimension plus the PLE's hash heads, and
+    # nothing else -- the mixers (attention ``o_proj``, GDN ``out_proj``) are deliberately left
+    # replicated, so this loader is rank-independent and needs no split. #736 prices that choice:
+    # one collective per layer instead of two, the LARGER decode win, and it keeps the model's
+    # 2 KV heads whole rather than splitting them one-per-rank with no margin.
     if not include_non_moe:
         return
 
@@ -244,6 +248,39 @@ def _ple_table_files(folder: str) -> list[str]:
     return sorted(os.path.join(folder, shard) for shard in files)
 
 
+def _ple_row_shard(folder: str, bank_rows: int) -> tuple[int, int]:
+    """This rank's ``[lo, hi)`` row range of the flat n-gram table (llm-server #725).
+
+    The table is sharded on the HASH HEAD axis: rank ``r`` owns heads
+    ``[r * H/tp, (r + 1) * H/tp)``, and because ``derive_ngram_hash_constants`` lays each head's
+    prime-sized vocab out back to back, those heads are one contiguous row range. The split point
+    is read from the checkpoint's OWN ``ngram_heads_offsets`` rather than recomputed from the
+    prime derivation, so a checkpoint whose constants ever diverge from the oracle shards
+    correctly instead of silently loading the wrong rows -- ``NGramEmbedding.local_row_base``
+    rebases lookups against the same tensor. The last rank absorbs the padding rows the bank is
+    rounded up to.
+    """
+    info = get_tp_info()
+    if info.size == 1:
+        return 0, bank_rows
+    offsets = None
+    index = os.path.join(folder, "model.safetensors.index.json")
+    with open(index, encoding="utf-8") as fh:
+        weight_map = json.load(fh)["weight_map"]
+    for name, shard in weight_map.items():
+        if name.endswith(".ple.ple_embedding.ngram_heads_offsets"):
+            with safetensors.safe_open(os.path.join(folder, shard), framework="pt",
+                                       device="cpu") as f:
+                offsets = f.get_tensor(name).tolist()
+            break
+    if offsets is None:
+        raise ValueError("PLE table cannot be TP-sharded: no ngram_heads_offsets in the checkpoint")
+    per_rank = div_even(len(offsets), info.size)
+    lo = int(offsets[per_rank * info.rank])
+    hi = bank_rows if info.rank == info.size - 1 else int(offsets[per_rank * (info.rank + 1)])
+    return lo, hi
+
+
 def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
                    workers: int = 8, chunk: int = 8 << 20) -> PleTable:
     """Concatenate the checkpoint's ``ngram_embedding.shard_<i>`` tensors into one pinned host bank.
@@ -288,17 +325,26 @@ def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
     if scale is None:
         raise ValueError("PLE table has no weight_scale")
 
-    bank = HostBank((expected * rows, cols), torch.float8_e4m3fn)
     shard_bytes = rows * cols
-    bar = byte_bar(expected * shard_bytes, "Loading PLE table")
+    row_lo, row_hi = _ple_row_shard(folder, expected * rows)
+    bank = HostBank((row_hi - row_lo, cols), torch.float8_e4m3fn)
+    bar = byte_bar((row_hi - row_lo) * cols, "Loading PLE table")
     try:
         buf = bank.memoryview()
         for shard in range(expected):
             path, offset, nbytes = parts[shard]
             assert nbytes == shard_bytes, f"PLE shard {shard} is {nbytes} B, expected {shard_bytes}"
-            read_range_into(buf, path, file_offset=offset, nbytes=nbytes,
-                            dest_offset=shard * shard_bytes, workers=workers, chunk=chunk)
-            bar.update(nbytes)
+            # This shard covers global rows [lo, hi); keep only its overlap with our own range.
+            # Exactly one shard straddles each boundary, and ``read_range_into`` bounces any
+            # sub-block-aligned window, so a partial read needs no special case here.
+            lo, hi = shard * rows, (shard + 1) * rows
+            take_lo, take_hi = max(lo, row_lo), min(hi, row_hi)
+            if take_lo >= take_hi:
+                continue
+            take = (take_hi - take_lo) * cols
+            read_range_into(buf, path, file_offset=offset + (take_lo - lo) * cols, nbytes=take,
+                            dest_offset=(take_lo - row_lo) * cols, workers=workers, chunk=chunk)
+            bar.update(take)
     finally:
         bar.close()
     if pin and torch.cuda.is_available():

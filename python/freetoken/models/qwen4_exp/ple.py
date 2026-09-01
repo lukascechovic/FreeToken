@@ -25,7 +25,9 @@ from typing import TYPE_CHECKING, List, Protocol, Sequence, Tuple
 import torch
 import torch.nn.functional as F
 from freetoken.core import get_global_ctx
+from freetoken.distributed import DistributedCommunicator, get_tp_info
 from freetoken.layers import BaseOP, LinearReplicated
+from freetoken.utils import div_even
 
 from .config import PLE_CONV_STATE, PLE_NGRAM_STATE
 from .hc import GroupedPlusOneRMSNorm
@@ -412,6 +414,20 @@ class NGramEmbedding(BaseOP):
         self.heads_per_ngram = args.heads_per_ngram
         self.num_heads = args.num_ngram_heads
         self.eos_token_id = args.ngram_boundary_token_id
+        # TP (llm-server #725, on #724's design): the PLE table is sharded on the HASH HEAD axis,
+        # not the embedding dim. Each head owns a disjoint contiguous row range of the flat table
+        # (``derive_ngram_hash_constants`` lays the per-head prime vocabs out back to back), so a
+        # head split is also a row split: this rank loads only its own rows and never touches the
+        # peer's. The lookup then produces this rank's ``local_num_heads * head_dim`` slice of the
+        # embedding, and one all-gather of the WHOLE embedding (E = ple_embed_dim * 2 B/token)
+        # rebuilds it -- which is why ``key_proj``/``value_proj`` below stay ``LinearReplicated``.
+        # ⛔ Sharding the embedding dim instead would force those to ``LinearRowParallel`` and an
+        # all-reduce of 5x the bytes.
+        self.tp = get_tp_info()
+        self._comm = DistributedCommunicator()
+        self.local_head_lo = div_even(self.num_heads, self.tp.size) * self.tp.rank
+        self.local_num_heads = div_even(self.num_heads, self.tp.size)
+        self.local_head_hi = self.local_head_lo + self.local_num_heads
         self.layer_multipliers = torch.empty(args.ngram_size, dtype=torch.int64)
         self.ngram_heads_vocab_sizes = torch.empty(self.num_heads, dtype=torch.int64)
         self.ngram_heads_offsets = torch.empty(self.num_heads, dtype=torch.int64)
@@ -463,7 +479,12 @@ class NGramEmbedding(BaseOP):
         return shifted
 
     def row_ids(self, meta: PLEMetadata) -> torch.Tensor:
-        """Global table row per (token, hash head): ``[T, num_ngram_heads]`` int64."""
+        """Table row per (token, hash head), ``[T, local_num_heads]`` int64.
+
+        At TP=1 these are the global rows and ``local_num_heads == num_ngram_heads``. At TP>1 the
+        ids are rebased onto this rank's shard by subtracting the row where its first head starts,
+        because the rank's bank holds only its own heads' rows, packed from zero.
+        """
         packed, select = self._window(meta)
         tokens = [select(s) for s in self._shift_ignore_eos(packed)]
         blocks = []
@@ -475,10 +496,34 @@ class NGramEmbedding(BaseOP):
                 mixed = torch.bitwise_xor(mixed, tokens[position] * self.layer_multipliers[position])
             head_ids = torch.remainder(mixed.unsqueeze(-1), self.ngram_heads_vocab_sizes[start:end])
             blocks.append(head_ids + self.ngram_heads_offsets[start:end])
-        return torch.cat(blocks, dim=-1)
+        rows = torch.cat(blocks, dim=-1)
+        if self.tp.size == 1:
+            return rows
+        return rows[..., self.local_head_lo:self.local_head_hi] - self.local_row_base
+
+    @property
+    def local_row_base(self) -> torch.Tensor:
+        """First global table row this rank owns -- its shard is packed from zero at this offset."""
+        return self.ngram_heads_offsets[self.local_head_lo]
 
     def forward(self, meta: PLEMetadata, out: torch.Tensor | None = None) -> torch.Tensor:
-        return self.table.lookup(self.row_ids(meta), out)
+        local = self.table.lookup(self.row_ids(meta))
+        if self.tp.size == 1:
+            if out is None:
+                return local
+            out.copy_(local)
+            return out
+        # ``all_gather`` concatenates on dim 0, so the gathered buffer is rank-major over tokens
+        # ([tp * T, local_width]); the embedding needs it token-major with the ranks' head slices
+        # side by side, which is that view transposed. Head order is preserved because rank r owns
+        # heads [r * local, (r + 1) * local) -- contiguous and in order.
+        gathered = self._comm.all_gather(local.contiguous())
+        tokens = local.shape[0]
+        full = gathered.view(self.tp.size, tokens, -1).transpose(0, 1).reshape(tokens, -1)
+        if out is None:
+            return full
+        out.copy_(full)
+        return out
 
 
 class _DepthwiseConv1d(BaseOP):

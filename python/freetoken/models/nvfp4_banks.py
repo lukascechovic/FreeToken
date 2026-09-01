@@ -62,6 +62,31 @@ def _alloc_nvfp4_host_banks(num_layers: int, E: int, H: int, I: int):
     }, num_layers)
 
 
+def _intermediate_shard(I: int) -> tuple[int, int]:
+    """This rank's slice of the expert intermediate dimension, as ``(I_per_rank, lo)``.
+
+    The MoE tensor-parallel axis (llm-server #725, on #724's design): every rank keeps all
+    ``E`` experts and every routing decision, and holds only its own ``I`` columns of them, so
+    the fused kernels stay dense-in/dense-out with static shapes and ``MoELayer._maybe_all_reduce``
+    already makes the sum exact. NVFP4 constrains the split twice over -- ``gate_up_packed``
+    packs two values per byte along ``H`` (so ``I`` is an unpacked row axis and any split is
+    legal), while ``down_packed``/``down_scale`` carry ``I`` as their packed and block axes and
+    need ``lo`` divisible by 2 and by the NVFP4 block of 16. ``div_even`` plus the block assert
+    below enforce exactly that; Qwen3.8-Flash-Next's ``I = 640 -> 320`` at TP=2 clears both.
+    """
+    from freetoken.distributed import get_tp_info
+    from freetoken.utils import div_even
+
+    info = get_tp_info()
+    per_rank = div_even(I, info.size)
+    if per_rank % 16:
+        raise ValueError(
+            f"NVFP4 expert intermediate shard {per_rank} (of {I} over TP={info.size}) is not a "
+            f"multiple of the NVFP4 block size 16; down_proj scales cannot be split"
+        )
+    return per_rank, per_rank * info.rank
+
+
 def load_nvfp4_expert_source_banks(
     model_path: str,
     config,
@@ -133,7 +158,8 @@ def load_nvfp4_expert_source_banks(
                 globals_map[key] = f.get_tensor(name).to(torch.float16)
         drop_page_cache(path)
 
-    _hb = _alloc_nvfp4_host_banks(num_layers, E, H, I)  # unpinned; pinned after fill
+    Ip, I_lo = _intermediate_shard(I)  # TP: this rank's columns of every expert (#725)
+    _hb = _alloc_nvfp4_host_banks(num_layers, E, H, Ip)  # unpinned; pinned after fill
     gate_up_packed = [b.tensor for b in _hb["gate_up_packed"]]
     gate_up_scale = [b.tensor for b in _hb["gate_up_scale"]]
     gate_up_global = [b.tensor for b in _hb["gate_up_global"]]
@@ -158,23 +184,29 @@ def load_nvfp4_expert_source_banks(
                     tensor = f.get_tensor(name)
                     if kind == "weight":
                         if role == "gate":
-                            gate_up_packed[bank_layer_id][expert, :I] = tensor
+                            gate_up_packed[bank_layer_id][expert, :Ip] = tensor[I_lo:I_lo + Ip]
                         elif role == "up":
-                            gate_up_packed[bank_layer_id][expert, I:] = tensor
+                            gate_up_packed[bank_layer_id][expert, Ip:] = tensor[I_lo:I_lo + Ip]
                         elif role == "down":
-                            down_packed[bank_layer_id][expert] = tensor
+                            # I is down_proj's PACKED axis: two fp4 values per byte.
+                            down_packed[bank_layer_id][expert] = tensor[
+                                :, I_lo // 2:(I_lo + Ip) // 2
+                            ]
                         else:
                             raise ValueError(f"{spec.desc}: unknown projection role {role!r}")
                     else:
                         global_scale = globals_map[(layer, expert, proj)]
                         if role == "gate":
-                            gate_up_scale[bank_layer_id][expert, :I] = tensor
-                            gate_up_global[bank_layer_id][expert, :I] = global_scale
+                            gate_up_scale[bank_layer_id][expert, :Ip] = tensor[I_lo:I_lo + Ip]
+                            gate_up_global[bank_layer_id][expert, :Ip] = global_scale
                         elif role == "up":
-                            gate_up_scale[bank_layer_id][expert, I:] = tensor
-                            gate_up_global[bank_layer_id][expert, I:] = global_scale
+                            gate_up_scale[bank_layer_id][expert, Ip:] = tensor[I_lo:I_lo + Ip]
+                            gate_up_global[bank_layer_id][expert, Ip:] = global_scale
                         elif role == "down":
-                            down_scale[bank_layer_id][expert] = tensor
+                            # I is down_scale's BLOCK axis: one scale per 16 fp4 values.
+                            down_scale[bank_layer_id][expert] = tensor[
+                                :, I_lo // 16:(I_lo + Ip) // 16
+                            ]
                             down_global[bank_layer_id][expert] = global_scale
                         else:
                             raise ValueError(f"{spec.desc}: unknown projection role {role!r}")
@@ -257,7 +289,8 @@ def load_nvfp4_expert_source_banks_parallel(
                 )
         drop_page_cache(path)
 
-    _hb = _alloc_nvfp4_host_banks(num_layers, E, H, I)  # unpinned; pinned after fill
+    Ip, I_lo = _intermediate_shard(I)  # TP: this rank's columns of every expert (#725)
+    _hb = _alloc_nvfp4_host_banks(num_layers, E, H, Ip)  # unpinned; pinned after fill
     gate_up_packed = [b.tensor for b in _hb["gate_up_packed"]]
     gate_up_scale = [b.tensor for b in _hb["gate_up_scale"]]
     gate_up_global = [b.tensor for b in _hb["gate_up_global"]]
@@ -282,21 +315,23 @@ def load_nvfp4_expert_source_banks_parallel(
             kind = match.group("kind")
             if kind == "weight":
                 if role == "gate":
-                    gate_up_packed[bank_layer_id][expert, :I] = tensor
+                    gate_up_packed[bank_layer_id][expert, :Ip] = tensor[I_lo:I_lo + Ip]
                 elif role == "up":
-                    gate_up_packed[bank_layer_id][expert, I:] = tensor
+                    gate_up_packed[bank_layer_id][expert, Ip:] = tensor[I_lo:I_lo + Ip]
                 else:
-                    down_packed[bank_layer_id][expert] = tensor
+                    # I is down_proj's PACKED axis: two fp4 values per byte.
+                    down_packed[bank_layer_id][expert] = tensor[:, I_lo // 2:(I_lo + Ip) // 2]
             else:
                 g = globals_map[(layer, expert, proj)]
                 if role == "gate":
-                    gate_up_scale[bank_layer_id][expert, :I] = tensor
-                    gate_up_global[bank_layer_id][expert, :I] = g
+                    gate_up_scale[bank_layer_id][expert, :Ip] = tensor[I_lo:I_lo + Ip]
+                    gate_up_global[bank_layer_id][expert, :Ip] = g
                 elif role == "up":
-                    gate_up_scale[bank_layer_id][expert, I:] = tensor
-                    gate_up_global[bank_layer_id][expert, I:] = g
+                    gate_up_scale[bank_layer_id][expert, Ip:] = tensor[I_lo:I_lo + Ip]
+                    gate_up_global[bank_layer_id][expert, Ip:] = g
                 else:
-                    down_scale[bank_layer_id][expert] = tensor
+                    # I is down_scale's BLOCK axis: one scale per 16 fp4 values.
+                    down_scale[bank_layer_id][expert] = tensor[:, I_lo // 16:(I_lo + Ip) // 16]
                     down_global[bank_layer_id][expert] = g
             tracker.note(bank_layer_id)
             placed += 1
