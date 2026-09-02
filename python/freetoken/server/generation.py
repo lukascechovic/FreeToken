@@ -434,14 +434,12 @@ async def prerender_error(spec: GenSpec, state: Any) -> GenerationError | None:
 
 
 def _multimodal_prompt_limit(state: Any) -> int | None:
-    """The frontend's view of the image-prompt ceiling, or None if it cannot see one.
+    """The operator's cap on an image prompt, or None when there is none (or no config).
 
-    Advisory. The frontend knows ``max_extend_tokens`` and the operator's cap, not the live
-    prefill budget the scheduler measures against, and the live budget is never larger -- so
-    this never falsely rejects. It can be too permissive, though, on a model whose cache caps
-    the prefill chunk below ``max_extend_tokens``: there a prompt between the two passes here
-    and is refused by the scheduler once the stream has started. Setting
-    ``--max-multimodal-prompt-tokens`` at or below that cap makes the pre-check exact.
+    The same number the scheduler's admission check reads, so the two cannot disagree: a
+    prompt over the cap is refused here, before the stream starts. With no cap an image
+    prompt is bounded by the context length alone, checked by the scheduler like any text
+    prompt -- the engine chunks a multimodal prefill, so no chunk-sized ceiling exists.
     """
     limit = getattr(getattr(state, "config", None), "multimodal_prompt_limit", None)
     return limit() if callable(limit) else None

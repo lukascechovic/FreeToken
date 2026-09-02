@@ -120,7 +120,7 @@ class Qwen4ExpModel(BaseOP):
         n_slots = int(mask.sum().item())
         assert n_slots == mm_embeds.shape[0], (
             f"image-token slots ({n_slots}) != vision features ({mm_embeds.shape[0]}); "
-            "image tokens must not be split across prefill chunks"
+            "the scheduler must hand each prefill chunk exactly its own soft-token rows"
         )
         return x.masked_scatter(mask.unsqueeze(-1), mm_embeds.to(x.dtype))
 

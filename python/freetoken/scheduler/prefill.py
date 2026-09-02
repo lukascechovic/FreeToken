@@ -37,6 +37,44 @@ class ChunkedReq(Req):
         return False  # avoid being added to decode manager
 
 
+def slice_mm_embeds(
+    input_ids: torch.Tensor,
+    mm_embeds: torch.Tensor,
+    image_token_id: int,
+    cached_len: int,
+    chunk_size: int,
+    is_last_chunk: bool,
+) -> torch.Tensor:
+    """The rows of ``mm_embeds`` whose placeholders fall in ``[cached_len, cached_len+chunk)``.
+
+    The model scatters image soft tokens POSITIONALLY: row *k* of the batch's ``mm_embeds``
+    lands on the *k*-th ``image_token_id`` in the batch's ``input_ids``, and a prefill batch
+    carries only this chunk's ids. So a chunk must be handed exactly the rows its own
+    placeholders will consume -- the ones after every placeholder already prefilled (the
+    cached prefix included: a prefix hit on a later turn skips its placeholders' rows too),
+    in prompt order. An image whose placeholder run straddles a chunk boundary is split with
+    it; nothing downstream cares, the tower's output is consumed one row per slot.
+
+    Returns an EMPTY ``[0, hidden]`` view for a chunk with no placeholder, not ``None``: the
+    cache manager reads ``req.mm_embeds is not None`` as "this request carries an image" and
+    keeps it out of the shared prefix cache, and that must hold for every chunk of the prompt.
+
+    ``is_last_chunk`` closes the books: on the chunk that ends the prompt every row must have
+    found its slot. The tokenizer worker checks that equality at ingest, the offline API
+    (``LLM.encode_images``) does not, and without this a surplus row would be dropped silently
+    -- each chunk's own count matches, so neither model assert would ever see it.
+    """
+    is_slot = input_ids[: cached_len + chunk_size] == image_token_id
+    start = int(is_slot[:cached_len].sum())
+    end = start + int(is_slot[cached_len:].sum())
+    rows = mm_embeds.shape[0]
+    assert end <= rows, f"image-token slots ({end}) exceed vision features ({rows})"
+    assert not is_last_chunk or end == rows, (
+        f"vision features ({rows}) exceed image-token slots ({end}) over the whole prompt"
+    )
+    return mm_embeds[start:end]
+
+
 @dataclass
 class PrefillAdder:
     token_budget: int
@@ -47,10 +85,9 @@ class PrefillAdder:
     # allocated only in allocate_paged (after the pass), so swa_available_size does not decrement
     # across the admission loop -- without this, successive admits all see the full pool.
     reserved_swa: int = 0
-    # This pass's STARTING budget, before admissions decrement token_budget. A multimodal prompt
-    # longer than this can never fit any pass, which is what separates "wait for room" from
-    # "this will spin forever" in _add_one_req.
-    full_token_budget: int = 0
+    # The placeholder id the model scatters image soft tokens over; None on a model without
+    # one. Needed to hand each chunk of a multimodal prompt its own rows (slice_mm_embeds).
+    image_token_id: int | None = None
 
     def _try_allocate_one(self, req: PendingReq):
         if self.table_manager.available_size == 0:
@@ -128,7 +165,6 @@ class PrefillAdder:
     ) -> Req | None:
         remain_len = pending_req.input_len - cached_len
         chunk_size = min(self.token_budget, remain_len)
-        swa_charged = 0  # this pass's swa reservation, undone if the request bails below
         if self.cache_manager.swa_paged:
             # Cap this chunk by the swa the pool can back this pass. swa is allocated per token in
             # allocate_paged, and token_budget (max_extend_tokens, default 8192) won't chunk a
@@ -158,10 +194,9 @@ class PrefillAdder:
                 if aligned <= 0:
                     return None
                 chunk_size = aligned
-            swa_charged = (
+            self.reserved_swa += (
                 div_ceil(cached_len + chunk_size, ps) - div_ceil(cached_len, ps)
             ) * ps
-            self.reserved_swa += swa_charged
         align = self.cache_manager.prefill_chunk_align
         if align > 1 and 0 < chunk_size < remain_len:
             # An unaligned chunk end is correct, it just loses this prompt's snapshot boundaries --
@@ -170,29 +205,21 @@ class PrefillAdder:
             aligned = align_down(cached_len + chunk_size, align) - cached_len
             chunk_size = aligned if aligned > 0 else chunk_size
         is_chunked = chunk_size < remain_len
-        if is_chunked and pending_req.mm_embeds is not None:
-            # A multimodal prompt cannot be split across chunks -- its soft tokens are scattered
-            # into the hidden states in a single pass. Two different situations reach here and
-            # they must not share an outcome:
-            #
-            #   * the prompt fits a full pass, but in-flight decode has eaten this pass's share
-            #     -> wait for a pass with room (the common case; admission already sized it);
-            #   * the prompt is longer than a full pass -> no pass will ever seat it, so
-            #     deferring would spin forever. Fail loudly instead, as this did before the
-            #     deferral existed.
-            #
-            # The second branch is the backstop that keeps the deferral honest on its own:
-            # `Scheduler._attach_mm_embeds` refuses an over-ceiling prompt at admission, but the
-            # budget can also shrink under an already-pending request (`rebuild_cache`), and the
-            # in-process offline path builds a UserMsg the scheduler's check cannot resize.
-            self.reserved_swa -= swa_charged
-            if remain_len > self.full_token_budget:
-                raise NotImplementedError(
-                    f"Multimodal prompts must fit in a single prefill chunk: {remain_len} tokens "
-                    f"> {self.full_token_budget} budget. Increase --max-extend-tokens or shrink "
-                    f"the prompt."
-                )
-            return None
+        # A multimodal prompt chunks exactly like a text prompt: the batch carries only this
+        # chunk's ids, so it is handed only this chunk's soft-token rows (and an empty tensor,
+        # never None, when the chunk holds no placeholder -- the cache manager keys "carries an
+        # image" on that). An image only reaches a model that declares its placeholder id (the
+        # tokenizer worker refuses otherwise), so a missing id here is an engine bug: handing
+        # the tensor over whole would scatter nothing and answer from a blank.
+        mm_embeds = pending_req.mm_embeds
+        if mm_embeds is not None:
+            assert self.image_token_id is not None, (
+                "multimodal prompt on a model that declares no image_token_id"
+            )
+            mm_embeds = slice_mm_embeds(
+                pending_req.input_ids, mm_embeds, self.image_token_id, cached_len, chunk_size,
+                is_last_chunk=not is_chunked,
+            )
         CLS = ChunkedReq if is_chunked else Req
         self.token_budget -= chunk_size
         self.reserved_size += remain_len + pending_req.output_len
@@ -208,7 +235,7 @@ class PrefillAdder:
             uid=pending_req.uid,
             cache_handle=cache_handle,
             sampling_params=pending_req.sampling_params,
-            mm_embeds=pending_req.mm_embeds,
+            mm_embeds=mm_embeds,
         )
         # Hybrid GDN per-request state slots (None for non-hybrid). On a fresh admit these are
         # freshly allocated; on a chunked continuation they are inherited from the prior chunk.
@@ -266,6 +293,8 @@ class PrefillManager:
     table_manager: TableManager
     decode_manager: DecodeManager
     pending_list: List[PendingReq] = field(default_factory=list)
+    # See PrefillAdder.image_token_id; the scheduler reads it off the model config.
+    image_token_id: int | None = None
 
     def add_one_req(self, req: UserMsg) -> None:
         self.pending_list.append(
@@ -279,10 +308,10 @@ class PrefillManager:
         # estimated offset due to in-flight decode
         adder = PrefillAdder(
             token_budget=prefill_budget,
-            full_token_budget=prefill_budget,
             reserved_size=self.decode_manager.inflight_tokens,
             cache_manager=self.cache_manager,
             table_manager=self.table_manager,
+            image_token_id=self.image_token_id,
         )
         reqs: List[Req] = []
         chunked_list: List[PendingReq] = []

@@ -194,19 +194,20 @@ def _config(**kwargs) -> SchedulerConfig:
     )
 
 
-def test_the_image_prompt_ceiling_is_the_lower_of_the_budget_and_the_operator_cap():
+def test_the_image_prompt_ceiling_is_the_operator_cap_or_nothing():
+    """Policy only: the engine chunks a multimodal prefill, so the prefill budget no longer
+    bounds an image prompt. Without a cap there is no image-specific ceiling at all."""
     config = _config(max_extend_tokens=8192)
-    assert config.multimodal_prompt_limit() == 8192
-    assert config.multimodal_prompt_limit(4096) == 4096          # a live prefill budget
-    capped = _config(max_extend_tokens=8192, max_multimodal_prompt_tokens=2048)
-    assert capped.multimodal_prompt_limit() == 2048
-    assert capped.multimodal_prompt_limit(4096) == 2048
-    assert capped.multimodal_prompt_limit(1024) == 1024
+    assert config.multimodal_prompt_limit() is None
+    capped = _config(max_extend_tokens=8192, max_multimodal_prompt_tokens=20480)
+    assert capped.multimodal_prompt_limit() == 20480          # may exceed the prefill chunk
+    assert _config(max_extend_tokens=8192, max_multimodal_prompt_tokens=2048).multimodal_prompt_limit() == 2048
 
 
 def test_both_refusals_tell_the_client_the_same_story():
     message = prompt_too_long_message(9000, 8192)
-    assert "9000" in message and "8192" in message and "--max-extend-tokens" in message
+    assert "9000" in message and "8192" in message and "--max-multimodal-prompt-tokens" in message
+    assert "prefill chunk" not in message and "--max-extend-tokens" not in message
 
 
 # --------------------------------------------------------------------------- #

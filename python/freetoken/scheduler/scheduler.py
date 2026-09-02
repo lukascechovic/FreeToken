@@ -90,7 +90,15 @@ class Scheduler(SchedulerIOMixin):
         )
         self.decode_manager = DecodeManager(config.page_size)
         self.prefill_manager = PrefillManager(
-            self.cache_manager, self.table_manager, self.decode_manager
+            self.cache_manager,
+            self.table_manager,
+            self.decode_manager,
+            # The placeholder id a multimodal prompt's soft tokens scatter over; the prefill
+            # adder needs it to hand each chunk its own rows. None on a text-only model. Read
+            # with getattr only because the scheduler tests build model_config as a bare
+            # SimpleNamespace; a real ModelConfig always declares the field, and the adder
+            # asserts on a multimodal prompt that reaches it as None.
+            image_token_id=getattr(config.model_config, "image_token_id", None),
         )
 
         # some alias for easy access
@@ -476,19 +484,17 @@ class Scheduler(SchedulerIOMixin):
         return torch.cuda.memory_reserved(self.device)
 
     def _multimodal_ceiling_error(self, msg: UserMsg) -> ErrorReplyMsg | None:
-        """Refuse an image prompt that no prefill pass can seat. The authoritative check.
+        """Refuse an image prompt over the operator's cap (``--max-multimodal-prompt-tokens``).
 
-        ``PrefillAdder`` cannot split a multimodal prompt across chunks -- its soft tokens are
-        scattered into the hidden states in one pass -- so a prompt over the budget would wait
-        for a pass that never comes. Naming it here makes it the client's 400.
-
-        Every request carrying vision input passes through here, whether it arrived as pixels
-        from the tokenizer worker or as embeddings the in-process offline API attached itself:
-        the deferral in ``PrefillAdder`` is only safe while this check has no way around it.
+        Policy only: the engine chunks a multimodal prompt across prefill passes like a text
+        prompt, so with no cap set an image prompt is bounded by the context check above and
+        nothing else. Every request carrying vision input passes through here, whether it
+        arrived as pixels from the tokenizer worker or as embeddings the in-process offline
+        API attached itself.
         """
-        limit = self.config.multimodal_prompt_limit(self.prefill_budget)
+        limit = self.config.multimodal_prompt_limit()
         input_len = len(msg.input_ids)
-        if input_len > limit:
+        if limit is not None and input_len > limit:
             return ErrorReplyMsg(
                 uid=msg.uid,
                 error=prompt_too_long_message(input_len, limit),
@@ -880,10 +886,12 @@ class Scheduler(SchedulerIOMixin):
 
     def _gather_multimodal(self, batch: Batch) -> None:
         """Concatenate per-request vision soft tokens (in request order) for a prefill
-        batch so the model can scatter them at image-token positions. ``req.mm_embeds``
-        is kept (not cleared) so the cache manager can recognize multimodal requests and
-        keep them out of the shared prefix cache (image placeholders share a token id but
-        carry per-image content)."""
+        batch so the model can scatter them at image-token positions. Each req carries the
+        rows for ITS OWN CHUNK only (``PrefillAdder`` slices them per chunk; a chunk with no
+        placeholder carries an empty tensor), so the concatenation matches the batch's ids
+        one row per slot. ``req.mm_embeds`` is kept (not cleared) so the cache manager can
+        recognize multimodal requests and keep them out of the shared prefix cache (image
+        placeholders share a token id but carry per-image content)."""
         parts = [req.mm_embeds for req in batch.reqs if req.mm_embeds is not None]
         if parts:
             batch.mm_embeds = torch.cat(parts, dim=0)

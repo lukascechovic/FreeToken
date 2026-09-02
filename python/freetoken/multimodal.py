@@ -52,8 +52,8 @@ def prompt_too_long_message(input_len: int, limit: int) -> str:
     """
     return (
         f"prompt is too long for an image request: {input_len} tokens > {limit} maximum "
-        f"(an image prompt must fit one prefill chunk); shorten the prompt, send a smaller "
-        f"image, or raise --max-extend-tokens"
+        f"(this server's --max-multimodal-prompt-tokens cap); shorten the prompt or send a "
+        f"smaller image"
     )
 
 

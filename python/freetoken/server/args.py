@@ -342,11 +342,10 @@ def parse_args(
         type=_positive_int,
         default=ServerArgs.max_multimodal_prompt_tokens,
         help=(
-            "Longest prompt accepted WITH an image, in tokens. An image prompt must fit one "
-            "prefill chunk, so the effective ceiling is this or --max-prefill-length, "
-            "whichever is lower; a longer prompt is refused with a 400. Set it at or below "
-            "the prefill chunk size to have that 400 raised before a stream starts. Default: "
-            "the prefill chunk size."
+            "Optional cap on the longest prompt accepted WITH an image, in tokens; a longer "
+            "one is refused with a 400 before its stream starts. Default: no cap -- an image "
+            "prompt is chunked across prefill passes like a text prompt and is bounded by the "
+            "context length alone."
         ),
     )
 
