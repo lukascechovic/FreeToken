@@ -43,6 +43,10 @@ class Req:
     # Optional precomputed multimodal soft-token embeddings (GPU, [num_image_tokens,
     # hidden]) scattered at image-token positions during this request's prefill.
     mm_embeds: torch.Tensor | None = None
+    # Prefix-cache key stream for an image request: ``input_ids`` with each picture's first
+    # placeholders replaced by pixel-hash markers (scheduler/mm_key.py). None = key on the real
+    # ids (text) or, together with ``mm_embeds``, bypass the cache (offline embeddings).
+    cache_key_ids: torch.Tensor | None = None
 
     # --- hybrid-radix (GDN linear-state) per-request slots; None for non-hybrid models or
     # until allocated from LinearStatePool. Set by the scheduler (P2). ---
@@ -88,6 +92,16 @@ class Req:
     def complete_one(self) -> None:
         self.cached_len = self.device_len
         self.device_len += 1
+
+    @property
+    def cache_ids(self) -> torch.Tensor:
+        """What the prefix cache keys on. Decode grows ``input_ids`` past the prompt, so the
+        marker stream is extended with the real ids that follow it."""
+        if self.cache_key_ids is None:
+            return self.input_ids
+        from freetoken.scheduler.mm_key import extend_key
+
+        return extend_key(self.cache_key_ids, self.input_ids)
 
     def append_host(self, next_token: torch.Tensor) -> None:
         n = self.input_ids.numel()

@@ -586,6 +586,22 @@ class Scheduler(SchedulerIOMixin):
                 if error is not None:
                     self.send_result([error])
                     return
+                if msg.pixel_values is not None:
+                    # The prefix-cache key stream: real ids with each picture's first placeholders
+                    # replaced by pixel-hash markers, so a session with a picture in it keeps its
+                    # prefix and a different picture can never hit the first one's KV. Derived on
+                    # every rank from the same pixels; None keeps the old bypass (mm_key.py).
+                    from freetoken.scheduler.mm_key import image_cache_key_ids
+
+                    msg.cache_key_ids = image_cache_key_ids(
+                        msg.input_ids, self.prefill_manager.image_token_id,
+                        msg.pixel_values, msg.image_position_ids,
+                    )
+                    if msg.cache_key_ids is None:
+                        logger.warning_rank0(
+                            "request %d: image prompt without a derivable cache key "
+                            "(placeholder runs != images); prefix cache bypassed", msg.uid,
+                        )
             self.prefill_manager.add_one_req(msg)
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)

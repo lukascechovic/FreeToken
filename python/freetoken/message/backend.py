@@ -44,6 +44,10 @@ class UserMsg(BaseBackendMsg):
     # ceiling in `Scheduler._multimodal_ceiling_error` binds whichever field carries an image.
     pixel_values: torch.Tensor | None = None
     image_position_ids: torch.Tensor | None = None
+    # Set by the scheduler on admission (never on the wire): ``input_ids`` with each image's
+    # first placeholders replaced by pixel-hash markers -- the prefix cache's key stream
+    # (scheduler/mm_key.py). None keeps the cache bypass for image requests.
+    cache_key_ids: torch.Tensor | None = None
 
 
 @dataclass
