@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import sys
 from pathlib import Path
 
 from setuptools import setup
@@ -101,6 +102,19 @@ setup(
             extra_compile_args=extra_compile,
             extra_link_args=runtime_link_args,
         ),
+        # --ple-backend disk row store (upstream #311, llm-server #735): plain C++ -- O_DIRECT
+        # preads, io_uring with a pread-pool fallback, and the stream memops resolved by dlopen
+        # at run time (libcuda; absent on ROCm => the launch-gating sync path). Linux-only until
+        # the TableFile/BatchReader seams grow Windows bodies.
+        *([
+            CppExtension(
+                name="freetoken.kernel._ple_store",
+                sources=[
+                    "python/freetoken/kernel/csrc/ple_store/ple_store_ext.cpp",
+                ],
+                extra_compile_args=["-O3", "-std=c++17"],
+            )
+        ] if sys.platform == "linux" else []),
         # CPU-compute MoE executor for --moe-backend cpu. Links cudart/amdhip64 for the
         # cudaLaunchHostFunc submit/sync graph nodes; the bf16 GEMV microkernels
         # use per-function target attributes (avx512bf16/avx512f) + a runtime

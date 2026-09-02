@@ -508,7 +508,10 @@ class NGramEmbedding(BaseOP):
 
     def forward(self, meta: PLEMetadata, out: torch.Tensor | None = None) -> torch.Tensor:
         local = self.table.lookup(self.row_ids(meta))
-        if self.tp.size == 1:
+        # A table that stages EVERY hash head on every rank (the disk backend hashes on the
+        # host from the full constants) already returns the full [T, 2560]; gathering it
+        # would double the width. llm-server #735 / upstream #311.
+        if self.tp.size == 1 or getattr(self.table, "serves_all_heads", False):
             if out is None:
                 return local
             out.copy_(local)
