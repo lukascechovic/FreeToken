@@ -19,7 +19,7 @@ from freetoken.message import (
     PromptAdmittedMsg,
     UserMsg,
 )
-from freetoken.multimodal import prompt_too_long_message
+from freetoken.multimodal import images_too_large_message, prompt_too_long_message
 from freetoken.utils import (
     init_logger,
     load_eos_token_ids,
@@ -57,6 +57,31 @@ class ForwardInput(NamedTuple):
 
 
 ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
+
+
+def _soft_token_count(msg: UserMsg, merge_size: int) -> int | None:
+    """How many soft tokens this request's images expand to, or None if it carries none.
+
+    Two shapes reach the scheduler and both are counted here, because the cap has to bind
+    whichever one arrived (the contract ``UserMsg`` states for the prompt ceiling):
+
+      * the ONLINE path sends preprocessed pixels -- ``image_position_ids`` is ``[N, P, 2]``
+        right-padded with ``(-1, -1)``, so the real patch count is the non-padded rows and
+        soft tokens are those divided by ``merge_size**2``. Counting the padding instead
+        would refuse a legal request whose batch happens to contain one large image.
+      * the OFFLINE path attaches ``mm_embeds`` directly, one row per soft token already.
+
+    ⛔ Counted BEFORE ``_attach_mm_embeds`` runs the tower: rejecting after the vision pass
+       would pay the very VRAM transient the cap exists to bound.
+    """
+    embeds = msg.mm_embeds
+    if embeds is not None:
+        return int(embeds.shape[0])
+    pos = msg.image_position_ids
+    if pos is None:
+        return None
+    patches = int((pos[..., 0] >= 0).sum())
+    return patches // (merge_size * merge_size)
 
 
 class Scheduler(SchedulerIOMixin):
@@ -483,15 +508,44 @@ class Scheduler(SchedulerIOMixin):
             return 0
         return torch.cuda.memory_reserved(self.device)
 
+    def _vision_merge_size(self) -> int:
+        """The model's ``spatial_merge_size`` -- how many patches collapse into one soft token.
+
+        Read from the loaded model rather than assumed, because it is what the tower actually
+        applies (`models/qwen4_exp/vision.py`'s ``merge_unit``). Falls back to 2, the value
+        every Qwen2VL-style checkpoint this engine serves uses, so a model that does not
+        publish one cannot turn the cap into a crash.
+        """
+        visual = getattr(self.engine.model, "visual", None)
+        config = getattr(visual, "_vc", None) or getattr(visual, "config", None)
+        size = getattr(config, "spatial_merge_size", None)
+        return int(size) if isinstance(size, int) and size > 0 else 2
+
     def _multimodal_ceiling_error(self, msg: UserMsg) -> ErrorReplyMsg | None:
-        """Refuse an image prompt over the operator's cap (``--max-multimodal-prompt-tokens``).
+        """Refuse an image request over either of the operator's two caps.
+
+        ``--max-image-soft-tokens`` bounds what the IMAGES expand to; it is checked first and
+        rejects before ``_attach_mm_embeds`` runs the tower, which is the point of it -- that
+        pass is the VRAM transient the cap exists to bound. ``--max-multimodal-prompt-tokens``
+        bounds the WHOLE prompt of an image request. ⚠ They are separate policies and #841
+        split them for a measured reason: one number cannot both keep a picture small and let
+        it arrive in a long conversation.
 
         Policy only: the engine chunks a multimodal prompt across prefill passes like a text
-        prompt, so with no cap set an image prompt is bounded by the context check above and
-        nothing else. Every request carrying vision input passes through here, whether it
+        prompt, so with neither cap set an image prompt is bounded by the context check above
+        and nothing else. Every request carrying vision input passes through here, whether it
         arrived as pixels from the tokenizer worker or as embeddings the in-process offline
         API attached itself.
         """
+        soft_limit = self.config.image_soft_token_limit()
+        if soft_limit is not None:
+            soft = _soft_token_count(msg, self._vision_merge_size())
+            if soft is not None and soft > soft_limit:
+                return ErrorReplyMsg(
+                    uid=msg.uid,
+                    error=images_too_large_message(soft, soft_limit),
+                    code="context_length_exceeded",
+                )
         limit = self.config.multimodal_prompt_limit()
         input_len = len(msg.input_ids)
         if limit is not None and input_len > limit:

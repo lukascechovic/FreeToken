@@ -86,6 +86,21 @@ def estimate_soft_tokens(
     return -(-patches // (merge_size * merge_size))
 
 
+def images_too_large_message(soft_tokens: int, limit: int) -> str:
+    """The one wording for a request whose images alone are over the ceiling.
+
+    Deliberately distinct from ``prompt_too_long_message``: that one is about how much
+    conversation the client sent, this one is about how big the pictures are, and telling a
+    client to "shorten the prompt" when the fix is to send a smaller image sends it in the
+    wrong direction. Both the frontend pre-check (``server/generation.py``) and the
+    authoritative admission check (``scheduler/scheduler.py``) refuse with this text.
+    """
+    return (
+        f"the images in this request expand to {soft_tokens} soft tokens > {limit} maximum "
+        f"(this server's --max-image-soft-tokens cap); send fewer or smaller images"
+    )
+
+
 def prompt_too_long_message(input_len: int, limit: int) -> str:
     """The one wording for an over-ceiling image prompt.
 

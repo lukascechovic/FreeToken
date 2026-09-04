@@ -338,6 +338,19 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--max-image-soft-tokens",
+        type=_positive_int,
+        default=ServerArgs.max_image_soft_tokens,
+        help=(
+            "Optional cap on what the IMAGES in one request expand to, in soft tokens; a "
+            "larger request is refused with a 400 from the image headers alone, before any "
+            "pixel is decoded. Bounds the two costs image size actually drives -- host RAM "
+            "during decode+patchify, and the vision tower's VRAM transient -- without "
+            "bounding how much conversation may accompany the picture. Default: no cap."
+        ),
+    )
+
+    parser.add_argument(
         "--max-multimodal-prompt-tokens",
         type=_positive_int,
         default=ServerArgs.max_multimodal_prompt_tokens,

@@ -20,6 +20,13 @@ class SchedulerConfig(EngineConfig):
     # (PrefillAdder hands each chunk its own soft-token rows). The number is a policy decision,
     # never an engine fact -- it is set on the command line, never derived here.
     max_multimodal_prompt_tokens: int | None = None
+    # An optional operator cap on the IMAGE half of a multimodal prompt, in soft tokens.
+    # Distinct from the cap above and deliberately so: that one bounds the whole prompt, so
+    # setting it small enough to bound a picture also forbids sending one in a long
+    # conversation. This one bounds only what the images themselves expand to, which is the
+    # quantity that drives host-RAM decode+patchify cost and the vision tower's VRAM
+    # transient. None (the default) = no image-size cap.
+    max_image_soft_tokens: int | None = None
     cache_type: str = "radix"
     offline_mode: bool = False
     decode_log_interval: int = 40
@@ -53,6 +60,15 @@ class SchedulerConfig(EngineConfig):
         they cannot disagree (the live prefill budget used to make them).
         """
         return self.max_multimodal_prompt_tokens
+
+    def image_soft_token_limit(self) -> int | None:
+        """The operator's cap on the images' own soft-token cost, or None when there is none.
+
+        Read by the frontend pre-check (from image headers, before any pixel decode) and by
+        the scheduler's admission check (from the decoded patch grid), so the two cannot
+        disagree -- the same contract the prompt cap above already keeps.
+        """
+        return self.max_image_soft_tokens
 
     @property
     def backend_create_detokenizer_link(self) -> bool:

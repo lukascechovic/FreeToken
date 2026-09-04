@@ -26,6 +26,7 @@ from freetoken.message import TokenizeMsg
 from freetoken.multimodal import (
     decode_anthropic_source,
     decode_image_url,
+    images_too_large_message,
     prompt_too_long_message,
 )
 from freetoken.tokenizer.tokenize import resolve_thinking_mode
@@ -423,7 +424,17 @@ async def prerender_error(spec: GenSpec, state: Any) -> GenerationError | None:
     # headers (no pixel decode) and is a guaranteed upper bound (see `estimate_soft_tokens`),
     # so it can reject early with no risk of wrongly admitting an oversized request.
     limit = _multimodal_prompt_limit(state)
-    if limit is not None:
+    # #841: the estimate below bounds the IMAGES, so it is checked against the image cap, not
+    # against the whole-prompt cap. Checking it against the prompt cap conflated two different
+    # policies in one number: a prompt cap small enough to bound a picture also refuses that
+    # picture in any conversation longer than the cap (measured on the deployed ctx262k row --
+    # every image request past ~8k context 400d, docs/research/freetoken-drop-0012-840 finding B).
+    # ⚠ Falls back to the prompt cap when no image cap is set, so a deployment carrying only the
+    # old flag keeps exactly the pre-decode protection #840 shipped.
+    soft_limit = _image_soft_token_limit(state)
+    if soft_limit is None:
+        soft_limit = limit
+    if soft_limit is not None:
         try:
             processor = await asyncio.to_thread(manager.multimodal_processor)
             estimated = await asyncio.to_thread(
@@ -431,9 +442,10 @@ async def prerender_error(spec: GenSpec, state: Any) -> GenerationError | None:
             )
         except Exception as exc:  # noqa: BLE001 -- mirror the worker's classification
             return GenerationError(f"could not encode request: {exc}")
-        if estimated > limit:
+        if estimated > soft_limit:
             return GenerationError(
-                prompt_too_long_message(estimated, limit), code="context_length_exceeded"
+                images_too_large_message(estimated, soft_limit),
+                code="context_length_exceeded",
             )
     # An image request is encoded in full here, not merely rendered: opening the picture is
     # where a malformed payload is caught, and the expanded length is what the prompt ceiling
@@ -449,6 +461,16 @@ async def prerender_error(spec: GenSpec, state: Any) -> GenerationError | None:
             prompt_too_long_message(input_len, limit), code="context_length_exceeded"
         )
     return None
+
+
+def _image_soft_token_limit(state: Any) -> int | None:
+    """The operator's cap on the images' own soft-token cost, or None when there is none.
+
+    The same number the scheduler's admission check reads, so the two cannot disagree -- the
+    contract ``_multimodal_prompt_limit`` below already keeps for the whole-prompt cap.
+    """
+    limit = getattr(getattr(state, "config", None), "image_soft_token_limit", None)
+    return limit() if callable(limit) else None
 
 
 def _multimodal_prompt_limit(state: Any) -> int | None:
