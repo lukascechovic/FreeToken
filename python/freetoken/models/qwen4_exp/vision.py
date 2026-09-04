@@ -36,6 +36,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Tuple
 
+import os
+
 import torch
 import torch.nn.functional as F
 from freetoken.layers import BaseOP, LayerNorm, LinearReplicated, OPList
@@ -196,8 +198,63 @@ class Qwen4ExpVisionModel(BaseOP):
         emb = torch.cat((freqs, freqs), dim=-1)  # [N, P, head_dim]
         return emb.cos().to(dtype), emb.sin().to(dtype)
 
+    # ⭐⭐ #841 bullet 3 -- BOUND THE VISION BATCH.
+    #
+    # The tower used to run on the whole request's images at once: `pixel_values [N, P, 1536]`
+    # right-padded to a common P.  Every intermediate is then `[N, P, ...]` and the SDPA score
+    # path is `[N, heads, P, P]`, so the tower's PEAK MEMORY IS LINEAR IN N.  Torch's caching
+    # allocator must find a new, larger contiguous block every time a request's image count
+    # grows, and the previous smaller ones are stranded as fragments it cannot reuse -- measured
+    # at ~0.19 GiB x N on the `-visi` row, and the whole reason #841 exists.
+    #
+    # ⭐⭐ SPLITTING THE BATCH IS THE SAME COMPUTATION, because NOTHING IN THIS TOWER CROSSES
+    # IMAGES.  Checked op by op: attention masks to each image's own patches
+    # (`attn_mask = valid[:, None, None, :]`), the position embedding is interpolated from each
+    # image's own `grid_h`/`grid_w`, and the merger ALREADY loops per image and returns a
+    # `torch.cat` over them.  The `N` dimension is pure parallelism.
+    #
+    # ⛔⛔ SAME, BUT *NOT BIT-IDENTICAL* -- an earlier draft of #841 claimed it was, wrongly.
+    # A different batch shape means different matmul tiling and SDPA reduction order, so results
+    # move at float rounding: measured **max|diff| 1.5e-08 in float32** (~3e-07 relative) on
+    # `test_vit_group_841.py`'s fixture.  ⭐ That it is ROUNDING and not a logic error is measured,
+    # not assumed: the same fixture in float64 gives 2.8e-17, a ratio of 5.4e08 that tracks machine
+    # epsilon.  The served tower runs in bf16, whose own rounding is orders of magnitude coarser.
+    #
+    # ⭐ Each group is also TRIMMED to its own longest image, so a group no longer pays the whole
+    # request's max `P`.  At group size 1 that removes the padding entirely -- strictly less memory
+    # AND less compute than the padded batch, since the attention no longer runs over pad columns.
+    #
+    # ⚠ The trade is tower parallelism: smaller groups serialise the encode.  Measure it.
+    # ⛔ `0` / unset keeps the historical all-at-once behaviour, so this is inert until switched on.
+    _VIT_GROUP_ENV = "FREETOKEN_VIT_GROUP"
+
+    def _group_size(self) -> int:
+        try:
+            return max(0, int(os.environ.get(self._VIT_GROUP_ENV, "0")))
+        except ValueError:  # noqa: BLE001 -- a bad env value must not take the tower down
+            return 0
+
     def forward(self, pixel_values: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
+        n = pixel_values.shape[0]
+        g = self._group_size()
+        if g <= 0 or n <= g:
+            return self._forward_group(pixel_values, position_ids)
+        outputs = []
+        for s in range(0, n, g):
+            outputs.append(
+                self._forward_group(pixel_values[s:s + g], position_ids[s:s + g])
+            )
+        return torch.cat(outputs, dim=0)
+
+    def _forward_group(self, pixel_values: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
         valid = (position_ids >= 0).all(dim=-1)  # [N, P] -- (-1, -1) marks padding
+        # Trim to THIS group's longest image. Valid patches are a contiguous prefix (asserted
+        # below), so the tail being dropped is padding only and the result is unchanged.
+        keep = int(valid.sum(dim=1).amax().item()) if valid.numel() else 0
+        if keep and keep < valid.shape[1]:
+            pixel_values = pixel_values[:, :keep]
+            position_ids = position_ids[:, :keep]
+            valid = valid[:, :keep]
         pos = position_ids.clamp(min=0)
         # Each image's own patch grid, read off its position ids (padding excluded).
         masked = torch.where(valid.unsqueeze(-1), position_ids, torch.full_like(position_ids, -1))
