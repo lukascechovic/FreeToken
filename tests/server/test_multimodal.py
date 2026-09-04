@@ -9,7 +9,11 @@ untouched by any of it.
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import struct
+import zlib
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -18,14 +22,21 @@ from freetoken.message import BaseBackendMsg, UserMsg
 from freetoken.multimodal import (
     MAX_IMAGE_BYTES,
     ImageError,
+    MultimodalProcessor,
     check_remote_url,
     decode_anthropic_source,
     decode_image_url,
+    estimate_soft_tokens,
     prompt_too_long_message,
 )
 from freetoken.scheduler.config import SchedulerConfig
 from freetoken.server.api_models import MessageContent
-from freetoken.server.generation import render_messages, render_messages_multimodal
+from freetoken.server.generation import (
+    GenSpec,
+    prerender_error,
+    render_messages,
+    render_messages_multimodal,
+)
 
 PNG = bytes.fromhex("89504e470d0a1a0a")  # just a header: nothing here opens the image
 B64 = base64.b64encode(PNG).decode()
@@ -208,6 +219,131 @@ def test_both_refusals_tell_the_client_the_same_story():
     message = prompt_too_long_message(9000, 8192)
     assert "9000" in message and "8192" in message and "--max-multimodal-prompt-tokens" in message
     assert "prefill chunk" not in message and "--max-extend-tokens" not in message
+
+
+# --------------------------------------------------------------------------- #
+# #840: the pre-decode estimate -- must reject an oversized request WITHOUT ever
+# opening/patchifying the images (that decode is itself what OOM-killed the host).
+# --------------------------------------------------------------------------- #
+def test_estimate_soft_tokens_matches_the_bullet1_worst_case_derivation():
+    # docs/research/freetoken-cache-sizing-worst-case-840/README.md §1: a 4096x4096 image
+    # against this checkpoint's real preprocessor_config.json costs exactly 16,384 soft tokens.
+    assert (
+        estimate_soft_tokens(
+            4096, 4096, patch_size=16, merge_size=2, min_pixels=65536, max_pixels=16_777_216
+        )
+        == 16384
+    )
+
+
+def test_estimate_soft_tokens_caps_at_max_pixels_instead_of_growing_unbounded():
+    small = estimate_soft_tokens(4096, 4096, patch_size=16, merge_size=2, max_pixels=16_777_216)
+    huge = estimate_soft_tokens(20000, 20000, patch_size=16, merge_size=2, max_pixels=16_777_216)
+    assert huge == small  # the real processor resizes down to fit; a bigger source image is free
+
+
+def test_estimate_soft_tokens_floors_at_min_pixels_instead_of_undercounting_a_tiny_image():
+    # The real processor upscales a tiny image to meet min_pixels; without the floor here this
+    # would report a lower cost than the image actually has once the real processor is done.
+    assert estimate_soft_tokens(1, 1, patch_size=16, merge_size=2, min_pixels=65536) == (
+        estimate_soft_tokens(256, 256, patch_size=16, merge_size=2)  # 256**2 == 65536
+    )
+
+
+def test_estimate_soft_tokens_rounds_up_never_down():
+    # 17x17 px at patch_size=16 doesn't divide evenly -- ceiling division must still count it as
+    # (at least) one patch. A floor-dividing version of this function would silently return 0 and
+    # let an image's cost vanish from the sum, defeating the whole gate.
+    assert estimate_soft_tokens(17, 17, patch_size=16, merge_size=2) > 0
+
+
+def test_estimate_soft_tokens_with_no_configured_bounds_uses_raw_pixels():
+    assert estimate_soft_tokens(32, 32, patch_size=16, merge_size=2) == 1  # 1024px -> 4 patches -> 1
+
+
+def _png(width: int, height: int) -> bytes:
+    """A minimal but fully valid 8-bit RGB PNG of the given size -- real enough for
+    ``Image.open`` to parse a header from, with no dependency on Pillow to build it."""
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data))
+
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    raw = b"".join(b"\x00" + b"\x00\x00\x00" * width for _ in range(height))
+    idat = zlib.compress(raw)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", idat) + chunk(b"IEND", b"")
+
+
+def test_estimate_prompt_soft_tokens_sums_a_batch_from_headers_alone():
+    # A bare SimpleNamespace stands in for MultimodalProcessor -- proves this method needs
+    # nothing but the four config numbers it reads in __init__, not a loaded HF checkpoint.
+    processor = SimpleNamespace(patch_size=2, merge_size=2, min_pixels=None, max_pixels=None)
+    blob = _png(8, 8)  # 64px -> patches=ceil(64/4)=16 -> soft=ceil(16/4)=4, per image
+    total = MultimodalProcessor.estimate_prompt_soft_tokens(processor, [blob, blob])
+    assert total == 8
+
+
+def test_estimate_prompt_soft_tokens_names_an_undecodable_image():
+    processor = SimpleNamespace(patch_size=2, merge_size=2, min_pixels=None, max_pixels=None)
+    with pytest.raises(ImageError, match="image 1 could not be decoded"):
+        MultimodalProcessor.estimate_prompt_soft_tokens(processor, [_png(8, 8), b"not an image"])
+
+
+class _FakeMultimodalManager:
+    """Stands in for ``TokenizeManager`` in ``prerender_error`` -- ``encode_calls`` is the
+    load-bearing assertion: it must stay 0 whenever the cheap estimate alone is enough to
+    refuse, because #840's whole point is that the real ``encode`` (which decodes and
+    patchifies every image) must never run for a request already known to be oversized."""
+
+    def __init__(self, *, estimate: int, encoded_len: int) -> None:
+        self._processor = SimpleNamespace(estimate_prompt_soft_tokens=lambda blobs: estimate)
+        self._encoded_len = encoded_len
+        self.encode_calls = 0
+
+    def multimodal_processor(self):
+        return self._processor
+
+    def encode(self, msg):
+        self.encode_calls += 1
+        return SimpleNamespace(input_ids=torch.zeros(self._encoded_len))
+
+
+def _mm_state(manager: _FakeMultimodalManager, *, limit: int) -> SimpleNamespace:
+    return SimpleNamespace(
+        frontend_tokenizer=lambda: manager,
+        config=SimpleNamespace(multimodal_prompt_limit=lambda: limit),
+    )
+
+
+def _image_spec() -> GenSpec:
+    return GenSpec(
+        messages=[{"role": "user", "content": [{"type": "image"}]}],
+        sampling_params=SamplingParams(),
+        images=[PNG],
+    )
+
+
+def test_prerender_error_rejects_before_the_real_decode_when_the_estimate_is_already_over():
+    manager = _FakeMultimodalManager(estimate=50_000, encoded_len=1)  # #840's worst-case shape
+    err = asyncio.run(prerender_error(_image_spec(), _mm_state(manager, limit=8192)))
+    assert err is not None and "50000" in str(err)
+    assert manager.encode_calls == 0  # the expensive step this ticket exists to prevent
+
+
+def test_prerender_error_still_runs_the_real_check_when_the_estimate_is_within_budget():
+    # The estimate alone must not be the final word -- an accepted request still gets the
+    # exact, authoritative check against the real tokenized length (unchanged behavior).
+    manager = _FakeMultimodalManager(estimate=100, encoded_len=9000)
+    err = asyncio.run(prerender_error(_image_spec(), _mm_state(manager, limit=8192)))
+    assert manager.encode_calls == 1
+    assert err is not None and "9000" in str(err)
+
+
+def test_prerender_error_admits_a_request_under_both_checks():
+    manager = _FakeMultimodalManager(estimate=100, encoded_len=100)
+    err = asyncio.run(prerender_error(_image_spec(), _mm_state(manager, limit=8192)))
+    assert err is None
+    assert manager.encode_calls == 1
 
 
 # --------------------------------------------------------------------------- #

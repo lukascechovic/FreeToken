@@ -416,6 +416,25 @@ async def prerender_error(spec: GenSpec, state: Any) -> GenerationError | None:
         except Exception as exc:  # noqa: BLE001 -- mirror the worker's classification
             return GenerationError(f"could not encode request: {exc}")
         return None
+    # #840: a request whose declared image dimensions alone already exceed the ceiling must
+    # never reach the full decode below -- decoding + patchifying every image in the request
+    # is itself expensive enough (host RAM, not GPU) that a large-enough batch OOM-kills the
+    # whole box before this function gets to return a 4xx. This estimate reads only image
+    # headers (no pixel decode) and is a guaranteed upper bound (see `estimate_soft_tokens`),
+    # so it can reject early with no risk of wrongly admitting an oversized request.
+    limit = _multimodal_prompt_limit(state)
+    if limit is not None:
+        try:
+            processor = await asyncio.to_thread(manager.multimodal_processor)
+            estimated = await asyncio.to_thread(
+                processor.estimate_prompt_soft_tokens, spec.images
+            )
+        except Exception as exc:  # noqa: BLE001 -- mirror the worker's classification
+            return GenerationError(f"could not encode request: {exc}")
+        if estimated > limit:
+            return GenerationError(
+                prompt_too_long_message(estimated, limit), code="context_length_exceeded"
+            )
     # An image request is encoded in full here, not merely rendered: opening the picture is
     # where a malformed payload is caught, and the expanded length is what the prompt ceiling
     # is measured against. Both must be a 4xx, and the scheduler's copy of each check would
@@ -424,7 +443,6 @@ async def prerender_error(spec: GenSpec, state: Any) -> GenerationError | None:
         encoded = await asyncio.to_thread(manager.encode, msg)
     except Exception as exc:  # noqa: BLE001 -- mirror the worker's classification
         return GenerationError(f"could not encode request: {exc}")
-    limit = _multimodal_prompt_limit(state)
     input_len = int(encoded.input_ids.numel())
     if limit is not None and input_len > limit:
         return GenerationError(

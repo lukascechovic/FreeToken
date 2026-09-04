@@ -43,6 +43,49 @@ class ImageError(ValueError):
     """A client-classifiable problem with a supplied image (4xx, never a 500)."""
 
 
+def _size_field(size: Any, field: str) -> int | None:
+    """Read one field off a processor's ``size`` dict-or-object, or None if absent.
+
+    HF image processors expose ``size`` as either a plain dict or a ``SizeDict``-like object
+    depending on version; this reads either without assuming which.
+    """
+    if size is None:
+        return None
+    getter = getattr(size, "get", None)
+    value = getter(field) if callable(getter) else getattr(size, field, None)
+    return int(value) if isinstance(value, (int, float)) else None
+
+
+def estimate_soft_tokens(
+    width: int,
+    height: int,
+    *,
+    patch_size: int,
+    merge_size: int,
+    min_pixels: int | None = None,
+    max_pixels: int | None = None,
+) -> int:
+    """Upper-bound soft-token cost of one image from its pixel dimensions alone.
+
+    Mirrors the resize-then-patchify arithmetic a real Qwen2VL-style processor performs
+    (#840 bullet 1: pixel count capped at ``max_pixels``, patches = pixels / patch_size**2,
+    soft tokens = patches / merge_size**2) but every division rounds up, and the pixel count
+    is also floored at ``min_pixels`` (the real processor upscales a tiny image to meet it,
+    which would otherwise make this under-count). Both adjustments push the result up, never
+    down, so it always returns >= what the real processor would produce for the same image --
+    never less. That direction is the only one that matters: this function exists to gate a
+    request before the real, expensive decode runs (``MultimodalProcessor.encode_chat``), and
+    an under-count would let an oversized request slip past the gate it exists to be.
+    """
+    pixels = width * height
+    if max_pixels is not None:
+        pixels = min(pixels, max_pixels)
+    if min_pixels is not None:
+        pixels = max(pixels, min_pixels)
+    patches = -(-pixels // (patch_size * patch_size))
+    return -(-patches // (merge_size * merge_size))
+
+
 def prompt_too_long_message(input_len: int, limit: int) -> str:
     """The one wording for an over-ceiling image prompt.
 
@@ -220,6 +263,10 @@ class MultimodalProcessor:
         if image_processor is None:
             raise RuntimeError(f"{model_path} has no image processor; this checkpoint is text-only")
         self.merge_size = int(getattr(image_processor, "merge_size", 2))
+        self.patch_size = int(getattr(image_processor, "patch_size", 14))
+        size = getattr(image_processor, "size", None)
+        self.max_pixels = _size_field(size, "longest_edge")
+        self.min_pixels = _size_field(size, "shortest_edge")
         self.image_token_id = _image_token_id(model_path, self.processor)
 
     def open_images(self, blobs: Sequence[bytes]) -> list[Any]:
@@ -234,6 +281,36 @@ class MultimodalProcessor:
                 raise ImageError(f"image {index} could not be decoded: {exc}") from exc
             images.append(image.convert("RGB"))
         return images
+
+    def estimate_prompt_soft_tokens(self, blobs: Sequence[bytes]) -> int:
+        """Upper bound on this batch's total image soft-token cost, from headers alone.
+
+        Reads each image only far enough to learn its pixel dimensions -- ``Image.open``
+        parses just the header; the actual decode (``.load()``) never runs, so cost stays
+        flat regardless of image size or count. Exists so an oversized multimodal request can
+        be refused *before* paying for real decode+patchify (#840: that step is what pushed a
+        15-image worst-case request over this box's last few GiB of host RAM and OOM-killed
+        the whole machine, not just the request). See ``estimate_soft_tokens`` for why the
+        result never falls below what ``encode_chat`` would actually produce.
+        """
+        from PIL import Image, UnidentifiedImageError
+
+        total = 0
+        for index, blob in enumerate(blobs):
+            try:
+                with Image.open(io.BytesIO(blob)) as image:
+                    width, height = image.size
+            except (UnidentifiedImageError, OSError, ValueError) as exc:
+                raise ImageError(f"image {index} could not be decoded: {exc}") from exc
+            total += estimate_soft_tokens(
+                width,
+                height,
+                patch_size=self.patch_size,
+                merge_size=self.merge_size,
+                min_pixels=self.min_pixels,
+                max_pixels=self.max_pixels,
+            )
+        return total
 
     def encode_chat(
         self,
