@@ -23,6 +23,8 @@ a picture's key would depend on what it was sent beside.
 packed ``[sum(P), D]`` run plus per-image patch counts. ⛔ The DIGEST IS UNCHANGED, deliberately:
 the padded path already hashed exactly ``pixels[:valid]``, so the same picture hashes to the same
 8 bytes either side of 0018 and no deployed row's prefix cache is invalidated by the patch.
+⭐ #898 (patch 0020) holds that same digest while dropping the redundant host copy it was built
+through; see ``image_digest``.
 
 Marker ids are NEGATIVE so they can never collide with a vocabulary id; they stay inside int32
 because ``input_ids`` is int32 on the wire and the trees key on ``tuple(ids.tolist())``. A run
@@ -57,12 +59,27 @@ def image_digest(pixels: torch.Tensor, position_ids: torch.Tensor) -> bytes:
 
     Takes one image: a packed run's slice (every row valid) or a padded tray's row (valid
     prefix, then ``(-1, -1)``). Both reduce to the same ``pixels[:valid]`` bytes.
+
+    ⭐ #898 (patch 0020): the patches are hashed IN PLACE. ``.numpy()`` is already zero-copy on
+    a CPU tensor, so the ``.tobytes()`` this used to call was a full extra host copy of the
+    patches -- 96 MiB per image at llama.cpp parity (16,384 patches), per turn, per rank, and
+    #883/#887 measured that it is paid on CACHED images too. ⛔ THE DIGEST IS UNCHANGED,
+    deliberately: ``hashlib.update`` reads the array through the buffer protocol and sees exactly
+    the bytes ``.tobytes()`` built, so the same picture hashes to the same 8 bytes either side of
+    0020 and no deployed row's prefix cache is invalidated
+    (``tests/scheduler/test_mm_key_digest_898.py``).
+
+    ⛔⛆ Hand the array to ``update`` RAW, never as ``memoryview(arr).cast("B")``: the cast raises
+    ``TypeError: cannot cast view with zeros in shape or strides`` on a zero-length buffer -- an
+    image with no valid patches -- which the ``.tobytes()`` path digested silently. Raw is also
+    fail-LOUD on a non-C-contiguous buffer (``ValueError``) instead of hashing the wrong bytes,
+    which is what makes the ``.contiguous()`` below load-bearing rather than decoration.
     """
     valid = int((position_ids[:, 0] >= 0).sum().item())
-    payload = pixels[:valid].detach().to("cpu", torch.float32).contiguous().numpy().tobytes()
+    patches = pixels[:valid].detach().to("cpu", torch.float32).contiguous().numpy()
     h = hashlib.blake2b(digest_size=8)
     h.update(valid.to_bytes(4, "little"))
-    h.update(payload)
+    h.update(patches)
     return h.digest()
 
 
@@ -113,8 +130,10 @@ def _per_image(
 ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
     """``[(pixels_i, positions_i), ...]`` from either batch shape -- packed run or padded tray.
 
-    Slicing a packed run is a view, so this adds no copy to the admission path; the digest's
-    ``.to("cpu", float32).contiguous()`` is where the bytes are materialised, exactly as before.
+    Slicing a packed run is a view, so this adds no copy to the admission path -- and since #898
+    (patch 0020) the digest does not materialise the bytes either: over the CPU float32 run the
+    tokenizer worker sends, its ``.to("cpu", float32).contiguous().numpy()`` is a chain of no-ops
+    over this same storage, and ``hashlib`` reads that storage directly.
     """
     from freetoken.scheduler.mm_encode import split_patch_counts
 
