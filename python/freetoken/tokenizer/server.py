@@ -270,6 +270,7 @@ def tokenize_worker(
                             sampling_params=msg.sampling_params,
                             pixel_values=e.pixel_values,
                             image_position_ids=e.image_position_ids,
+                            image_patch_counts=e.image_patch_counts,
                         )
                         for msg, e in zip(ok_msgs, ok_encoded, strict=True)
                     ]

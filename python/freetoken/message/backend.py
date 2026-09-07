@@ -39,11 +39,16 @@ class UserMsg(BaseBackendMsg):
     mm_embeds: torch.Tensor | None = None
     # The online multimodal path. A GPU tensor cannot cross the wire, and the vision tower lives
     # with the model, so the tokenizer worker sends the *preprocessed pixels* and the scheduler
-    # runs `encode_images` on admission. CPU, [N, P, D] float32 and [N, P, 2] int64 with
-    # (-1, -1) right-padding -- the contract `Qwen4ExpVisionModel.forward` reads. The prompt
-    # ceiling in `Scheduler._multimodal_ceiling_error` binds whichever field carries an image.
+    # runs `encode_images` on admission. The prompt ceiling in
+    # `Scheduler._multimodal_ceiling_error` binds whichever field carries an image.
+    # ⭐⭐ #890 (patch 0018): CPU, PACKED -- [sum(P), D] float32 and [sum(P), 2] int64, every
+    # image's patches back to back with no padding rows, plus the counts that say where each
+    # image ends. This used to be the tower's right-padded [N, P_max, D] tray, whose cost is
+    # `n_images x P_max` and is therefore unbounded by the soft-token cap (#883 rung B6 killed
+    # the row at 51% of it). `scheduler/mm_encode.py` splits the run per image at the device.
     pixel_values: torch.Tensor | None = None
     image_position_ids: torch.Tensor | None = None
+    image_patch_counts: List[int] | None = None
     # Set by the scheduler on admission (never on the wire): ``input_ids`` with each image's
     # first placeholders replaced by pixel-hash markers -- the prefix cache's key stream
     # (scheduler/mm_key.py). None keeps the cache bypass for image requests.

@@ -32,10 +32,12 @@ def serialize_type(self) -> Dict:
     serialized = {}
 
     if isinstance(self, torch.Tensor):
-        # Prompts are 1-D; multimodal pixel/position batches are [N, P, D] and [N, P, 2], so
-        # the shape rides along and the decoder restores it. A 1-D tensor round-trips
-        # unchanged, and a message written before `shape` existed still decodes (the reader
-        # treats a missing shape as "already the right one").
+        # Prompts are 1-D; multimodal pixel/position batches are 2-D since #890 ([sum(P), D] and
+        # [sum(P), 2]; they were 3-D [N, P, *] before it), so the shape rides along and the
+        # decoder restores it. Either way `tobytes()` is a full copy of whatever is handed over,
+        # which is the second reason #890 packs: this buffer used to carry the padding too.
+        # A 1-D tensor round-trips unchanged, and a message written before `shape` existed
+        # still decodes (the reader treats a missing shape as "already the right one").
         assert not self.is_cuda, "only CPU tensors cross the message wire"
         serialized["__type__"] = "Tensor"
         serialized["buffer"] = self.contiguous().numpy().tobytes()

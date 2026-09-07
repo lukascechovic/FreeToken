@@ -65,10 +65,12 @@ def _soft_token_count(msg: UserMsg, merge_size: int) -> int | None:
     Two shapes reach the scheduler and both are counted here, because the cap has to bind
     whichever one arrived (the contract ``UserMsg`` states for the prompt ceiling):
 
-      * the ONLINE path sends preprocessed pixels -- ``image_position_ids`` is ``[N, P, 2]``
-        right-padded with ``(-1, -1)``, so the real patch count is the non-padded rows and
-        soft tokens are those divided by ``merge_size**2``. Counting the padding instead
-        would refuse a legal request whose batch happens to contain one large image.
+      * the ONLINE path sends preprocessed pixels. Since #890 those are PACKED,
+        ``[sum(P), 2]`` with no padding rows, so every row counts; the offline tray
+        ``[N, P, 2]`` right-padded with ``(-1, -1)`` also still reaches here, and the same
+        ``>= 0`` test reads both. Counting padding would refuse a legal request whose batch
+        happens to contain one large image -- which is why the test is on the ids, not the
+        shape.
       * the OFFLINE path attaches ``mm_embeds`` directly, one row per soft token already.
 
     ⛔ Counted BEFORE ``_attach_mm_embeds`` runs the tower: rejecting after the vision pass
@@ -562,6 +564,15 @@ class Scheduler(SchedulerIOMixin):
         This is where the pixels the tokenizer worker sent become soft-token embeddings, on the
         device that holds the model. A model with no vision tower is the client's error too:
         a dropped image returning 200 is the exact failure this whole path exists to end.
+
+        ⭐⭐ #890 (patch 0018): ONE IMAGE AT A TIME. The whole ``[N, P_max, D]`` batch used to
+        cross to the device in a single ``.to()`` -- #871 measured 2.21 GiB of float32 landing
+        before the tower could split anything, which ``FREETOKEN_VIT_GROUP=1`` cannot reach
+        because it is downstream of the copy. See ``scheduler/mm_encode.py``.
+
+        ⛔ The ``except`` below is still the only early return here whose outcome can differ per
+        rank, so it is still #871's TP>1 desync. 0018 makes it far less likely to be reached;
+        removing it needs the all-rank failure agreement ``scheduler.py`` names as deferred.
         """
         encode = getattr(self.engine.model, "encode_images", None)
         if encode is None:
@@ -573,9 +584,15 @@ class Scheduler(SchedulerIOMixin):
                 ),
                 code="invalid_request_error",
             )
+        from freetoken.scheduler.mm_encode import encode_one_at_a_time
+
         try:
-            msg.mm_embeds = encode(
-                msg.pixel_values.to(self.device), msg.image_position_ids.to(self.device)
+            msg.mm_embeds = encode_one_at_a_time(
+                encode,
+                msg.pixel_values,
+                msg.image_position_ids,
+                self.device,
+                msg.image_patch_counts,
             )
         except Exception as exc:  # noqa: BLE001 -- one bad image must not take the engine down
             logger.warning_rank0("vision encode failed for request %d: %r", msg.uid, exc)
@@ -650,12 +667,24 @@ class Scheduler(SchedulerIOMixin):
                     msg.cache_key_ids = image_cache_key_ids(
                         msg.input_ids, self.prefill_manager.image_token_id,
                         msg.pixel_values, msg.image_position_ids,
+                        msg.image_patch_counts,
                     )
                     if msg.cache_key_ids is None:
                         logger.warning_rank0(
                             "request %d: image prompt without a derivable cache key "
                             "(placeholder runs != images); prefix cache bypassed", msg.uid,
                         )
+                    # ⭐ #890: the pixels have done both jobs they came for -- the tower has run
+                    # and the cache key is derived -- and `add_one_req` never carries them into
+                    # `PendingReq`. Dropping the reference here bounds the SCHEDULER's host peak
+                    # to one request's pixels even when a batch admits several image requests,
+                    # instead of holding every one of them until the batch loop ends.
+                    # ⚠ This is the scheduler's decoded copy only. #876/#883's residue is the
+                    # TOKENIZER WORKER's, and no request-lifecycle event returns that one -- see
+                    # `multimodal._pack_batch`.
+                    msg.pixel_values = None
+                    msg.image_position_ids = None
+                    msg.image_patch_counts = None
             self.prefill_manager.add_one_req(msg)
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)

@@ -156,8 +156,9 @@ def test_same_pixels_same_key_different_pixels_different_key():
 
 
 def test_right_padding_from_a_neighbour_image_does_not_change_the_key():
-    """_pad_batch pads every image to the widest in the request; the same picture next to a
-    bigger one must key the same as it does alone."""
+    """The padded tray (still the offline shape, and every shape before #890) pads every image
+    to the widest in the request; the same picture next to a bigger one must key the same as it
+    does alone. ``test_mm_encode_890.py`` carries the packed half of this."""
     pixels_alone, pos_alone = _images([1], [4])
     pixels_padded, pos_padded = _images([1, 2], [4, 9])
     assert image_digest(pixels_alone[0], pos_alone[0]) == image_digest(pixels_padded[0], pos_padded[0])

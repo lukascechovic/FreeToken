@@ -16,9 +16,13 @@ Two different pictures diverge at their first placeholder; the same picture, sam
 Why hash the PIXELS here and not the bytes in the tokenizer worker: every TP rank receives the
 same ``UserMsg`` and must derive the same key without another wire field, and the preprocessed
 patches are what the tower actually sees (a re-encoded JPEG of the same picture keys the same
-way its patches do). Only the VALID patches are hashed -- ``_pad_batch`` right-pads every image
-to the widest one in the request, so hashing the padded row would make a picture's key depend
-on its neighbours.
+way its patches do). Only that image's OWN patches are hashed, never a neighbour's -- otherwise
+a picture's key would depend on what it was sent beside.
+
+⭐ #890 (patch 0018) changed the batch this reads from a right-padded ``[N, P_max, D]`` tray to a
+packed ``[sum(P), D]`` run plus per-image patch counts. ⛔ The DIGEST IS UNCHANGED, deliberately:
+the padded path already hashed exactly ``pixels[:valid]``, so the same picture hashes to the same
+8 bytes either side of 0018 and no deployed row's prefix cache is invalidated by the patch.
 
 Marker ids are NEGATIVE so they can never collide with a vocabulary id; they stay inside int32
 because ``input_ids`` is int32 on the wire and the trees key on ``tuple(ids.tolist())``. A run
@@ -49,7 +53,11 @@ def placeholder_runs(input_ids: torch.Tensor, image_token_id: int) -> List[Tuple
 
 
 def image_digest(pixels: torch.Tensor, position_ids: torch.Tensor) -> bytes:
-    """8-byte digest of ONE image's valid patches (``position_ids`` row -1 marks padding)."""
+    """8-byte digest of ONE image's valid patches (``position_ids`` row -1 marks padding).
+
+    Takes one image: a packed run's slice (every row valid) or a padded tray's row (valid
+    prefix, then ``(-1, -1)``). Both reduce to the same ``pixels[:valid]`` bytes.
+    """
     valid = int((position_ids[:, 0] >= 0).sum().item())
     payload = pixels[:valid].detach().to("cpu", torch.float32).contiguous().numpy().tobytes()
     h = hashlib.blake2b(digest_size=8)
@@ -69,6 +77,7 @@ def image_cache_key_ids(
     image_token_id: int | None,
     pixel_values: torch.Tensor | None,
     image_position_ids: torch.Tensor | None,
+    image_patch_counts: List[int] | None = None,
 ) -> torch.Tensor | None:
     """The cache key stream for an image request, or ``None`` to keep today's bypass.
 
@@ -79,16 +88,47 @@ def image_cache_key_ids(
     """
     if image_token_id is None or pixel_values is None or image_position_ids is None:
         return None
+    try:
+        images = _per_image(pixel_values, image_position_ids, image_patch_counts)
+    except ValueError:
+        # A packed run whose counts did not arrive cannot be split soundly. Bypass, never guess:
+        # a bypass costs reuse, a wrong key serves another picture's KV.
+        return None
     runs = placeholder_runs(input_ids, image_token_id)
-    n_images = int(pixel_values.shape[0])
+    n_images = len(images)
     if n_images == 0 or len(runs) != n_images:
         return None
     key = input_ids.clone()
-    for (start, length), pixels, pos in zip(runs, pixel_values, image_position_ids):
+    for (start, length), (pixels, pos) in zip(runs, images):
         marks = markers_from_digest(image_digest(pixels, pos))
         for k in range(min(MARKERS_PER_IMAGE, length)):
             key[start + k] = marks[k]
     return key
+
+
+def _per_image(
+    pixel_values: torch.Tensor,
+    image_position_ids: torch.Tensor,
+    image_patch_counts: List[int] | None,
+) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+    """``[(pixels_i, positions_i), ...]`` from either batch shape -- packed run or padded tray.
+
+    Slicing a packed run is a view, so this adds no copy to the admission path; the digest's
+    ``.to("cpu", float32).contiguous()`` is where the bytes are materialised, exactly as before.
+    """
+    from freetoken.scheduler.mm_encode import split_patch_counts
+
+    counts = split_patch_counts(image_position_ids, image_patch_counts)
+    if image_position_ids.dim() == 3:
+        return [(pixel_values[i], image_position_ids[i]) for i in range(len(counts))]
+    out: List[Tuple[torch.Tensor, torch.Tensor]] = []
+    offset = 0
+    for count in counts:
+        out.append(
+            (pixel_values[offset : offset + count], image_position_ids[offset : offset + count])
+        )
+        offset += count
+    return out
 
 
 def extend_key(key_ids: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:

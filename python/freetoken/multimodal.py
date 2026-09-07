@@ -10,9 +10,19 @@ Two contracts this module exists to keep:
 * A dropped image is never a success. Every failure below raises ``ValueError`` with a
   legible message, which each adapter turns into a 4xx. Silently continuing past an image
   the server cannot serve is what made an operator believe a text-only row had vision.
-* The tower takes a right-padded batch, ``[N, P, D]`` + ``[N, P, 2]`` with ``(-1, -1)``
-  padding, while HF's processor emits ONE packed image, ``[sum(P), ...]``. ``_pad_batch``
-  is that bridge, and it is the only place the two shapes meet.
+* The tower takes ONE image at a time, ``[1, P, D]`` + ``[1, P, 2]``, and HF's processor
+  emits every image packed into one ``[sum(P), ...]`` run. ``_pack_batch`` keeps the packed
+  shape and records where each image starts, so the two meet per image at the device edge
+  (``scheduler/mm_encode.py``) instead of in a right-padded ``[N, P_max, D]`` tray here.
+
+  ⭐⭐ #890 (patch 0018) removed that tray. It cost ``n_images x P_max`` float32 patches of
+  host RAM -- allocated, then copied again onto the wire, then decoded on the scheduler side
+  -- for a request whose real content is ``sum(P)``. #883 measured the retained copy at
+  ``alpha ~ 1.0`` of the tray and fitted the tokenizer worker's floor at
+  ``405 + 1.02*(n x P_max) + 0.35*Sum`` MiB, and #883 rung B6 (one big image beside six tiny
+  ones) drove that worker to 8.81 GiB and KILLED THE ROW on a request at 51% of the deployed
+  soft-token cap -- because the cap bounds ``Sum`` and NOTHING bounds ``n_images``. Packing
+  makes the cost track the content, which is the only term a soft-token cap can see.
 """
 
 from __future__ import annotations
@@ -256,8 +266,10 @@ class EncodedPrompt:
     """One tokenized prompt plus the vision inputs its placeholders are waiting for."""
 
     input_ids: torch.Tensor                      # 1-D int32
-    pixel_values: torch.Tensor | None = None     # [N, P, D] float32
-    image_position_ids: torch.Tensor | None = None  # [N, P, 2] int64, (-1, -1) padded
+    # ⭐ #890: PACKED, not padded -- every image's patches back to back, in document order.
+    pixel_values: torch.Tensor | None = None     # [sum(P), D] float32
+    image_position_ids: torch.Tensor | None = None  # [sum(P), 2] int64, no padding rows
+    image_patch_counts: list[int] | None = None  # P per image; where the packed run splits
 
 
 class MultimodalProcessor:
@@ -350,11 +362,12 @@ class MultimodalProcessor:
             **chat_template_kwargs,
         )
         input_ids = encoded["input_ids"][0].reshape(-1).to(torch.int32)
-        pixel_values, position_ids, per_image = _pad_batch(
+        pixel_values, position_ids, patch_counts = _pack_batch(
             encoded["pixel_values"], encoded["image_grid_thw"], self.merge_size
         )
+        unit = self.merge_size * self.merge_size
         slots = int((input_ids == self.image_token_id).sum())
-        soft = sum(per_image)
+        soft = sum(count // unit for count in patch_counts)
         # The scatter in `_merge_multimodal` asserts this equality and an off-by-one is an
         # engine-side assertion, not a wrong answer. Name it here, where it is still a 4xx.
         if slots != soft:
@@ -362,7 +375,7 @@ class MultimodalProcessor:
                 f"prompt has {slots} image placeholders but the images produce {soft} soft "
                 "tokens; the chat template and the image processor disagree"
             )
-        return EncodedPrompt(input_ids, pixel_values, position_ids)
+        return EncodedPrompt(input_ids, pixel_values, position_ids, patch_counts)
 
 
 def _image_token_id(model_path: str, processor: Any) -> int:
@@ -408,39 +421,61 @@ def _attach_images(messages: list[dict], images: Sequence[Any]) -> tuple[list[di
     return out, used
 
 
-def _pad_batch(
+def _pack_batch(
     packed: torch.Tensor, grid_thw: torch.Tensor, merge_size: int
 ) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
-    """HF's packed ``[sum(P), D]`` -> the tower's right-padded ``[N, P_max, D]``.
+    """HF's packed ``[sum(P), D]`` -> the same packed run, checked, plus where it splits.
 
-    Returns ``(pixel_values, position_ids, soft_tokens_per_image)``. Padding is zero pixels and
-    ``(-1, -1)`` position ids -- the tower reads each image's grid off the ids, masks the pad
-    out of attention, and merges only the valid prefix.
+    Returns ``(pixel_values, position_ids, patch_counts)``. ``patch_counts[i]`` is image ``i``'s
+    patch count, so the run ``pixel_values[sum(counts[:i]) : sum(counts[:i+1])]`` is that image
+    and nothing else. ``scheduler/mm_encode.py`` is what splits it, one image at a time, on the
+    device edge.
+
+    ⭐⭐ #890 (patch 0018). This function used to build the tower's right-padded
+    ``[N, P_max, D]`` batch here, in the tokenizer worker, on the host:
+
+        pixel_values = packed.new_zeros((n_images, p_max, packed.shape[-1]))
+
+    ⛔ That allocation is ``n_images x P_max``, not ``sum(P)``, and the two diverge without
+    limit as soon as a request mixes image sizes -- #883 rung B4 (one 2048 sq. + six 1024 sq.)
+    paid 4x its own content, and rung B6 (one big image beside six thumbnails) asked for
+    ``7 x P_big`` and took the worker to 8.81 GiB, killing the row at 51% of the deployed
+    ``--max-image-soft-tokens``. The cap could not see it: the cap bounds ``sum(P)`` and the
+    allocation is ``n_images x P_max``, so the two are ANTI-correlated (#883 section 5).
+    ⛔ And nothing anywhere bounds ``n_images``.
+
+    ⚠ Keeping the packed run is not free of the tray's other costs by accident -- it removes
+    them by construction. The tray was allocated once here, copied a second time into the
+    message buffer (``message/utils.py`` ``serialize_type`` -> ``tobytes()``), and copied a
+    third time when the scheduler decoded it. All three now carry ``sum(P)``.
+
+    ⚠ What this does NOT remove: HF's own packed tensor, #883's sum-proportional
+    ``beta ~ 0.35`` term. It is the content, so no packing fix can reach it.
     """
     from transformers.vision_utils import get_vision_position_ids
 
-    position_ids = get_vision_position_ids(grid_thw, merge_size)
     counts = [int(t) * int(h) * int(w) for t, h, w in grid_thw.tolist()]
+    # The tower merges each image over whole spatial-merge blocks and asserts on a remainder.
+    # Checked here, where it is still a 4xx -- and BEFORE the position ids are built, so a grid
+    # the position helper would itself reject is named as the image problem it is.
+    unit = merge_size * merge_size
+    for index, count in enumerate(counts):
+        if count % unit:
+            raise ImageError(
+                f"image {index}: {count} patches is not a multiple of {unit}; the processor "
+                "emits whole spatial-merge blocks"
+            )
+    position_ids = get_vision_position_ids(grid_thw, merge_size)
     total = sum(counts)
     if packed.shape[0] != total or position_ids.shape[0] != total:
         raise ImageError(
             f"processor emitted {packed.shape[0]} patches and {position_ids.shape[0]} position "
             f"ids for a grid totalling {total}"
         )
-    n_images = len(counts)
-    p_max = max(counts)
-    pixel_values = packed.new_zeros((n_images, p_max, packed.shape[-1]))
-    padded_pos = position_ids.new_full((n_images, p_max, position_ids.shape[-1]), -1)
-    offset = 0
-    for index, count in enumerate(counts):
-        pixel_values[index, :count] = packed[offset : offset + count]
-        padded_pos[index, :count] = position_ids[offset : offset + count]
-        offset += count
-    unit = merge_size * merge_size
     return (
-        pixel_values.to(torch.float32).contiguous(),
-        padded_pos.to(torch.int64).contiguous(),
-        [count // unit for count in counts],
+        packed.to(torch.float32).contiguous(),
+        position_ids.to(torch.int64).contiguous(),
+        counts,
     )
 
 

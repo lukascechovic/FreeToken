@@ -48,12 +48,19 @@ class LLM(Scheduler):
         self, pixel_values: torch.Tensor, image_position_ids: torch.Tensor
     ) -> torch.Tensor:
         """Run the vision tower + projector on processor outputs, returning the
-        ``[num_image_tokens, hidden]`` soft-token embeddings (on device)."""
+        ``[num_image_tokens, hidden]`` soft-token embeddings (on device).
+
+        Takes the documented right-padded ``[N, P, D]`` batch. ⭐ #890 (patch 0018): the images
+        cross to the device ONE AT A TIME, so this API's peak is the largest image rather than
+        the whole padded tray. The offline contract is unchanged -- only the transfer is.
+        """
+        from freetoken.scheduler.mm_encode import encode_one_at_a_time
+
         model = self.engine.model
         if not hasattr(model, "encode_images"):
             raise RuntimeError(f"{type(model).__name__} does not support image inputs")
-        return model.encode_images(
-            pixel_values.to(self.device), image_position_ids.to(self.device)
+        return encode_one_at_a_time(
+            model.encode_images, pixel_values, image_position_ids, self.device
         )
 
     def _tokenize_one(self, prompt: List[int] | str) -> torch.Tensor:
