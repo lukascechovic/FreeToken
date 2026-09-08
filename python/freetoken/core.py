@@ -47,6 +47,10 @@ class Req:
     # placeholders replaced by pixel-hash markers (scheduler/mm_key.py). None = key on the real
     # ids (text) or, together with ``mm_embeds``, bypass the cache (offline embeddings).
     cache_key_ids: torch.Tensor | None = None
+    # #892 (patch 0019): how many LEADING soft-token rows are absent from ``mm_embeds`` because
+    # the prefix cache already held those images and the vision tower was never run on them.
+    # ``slice_mm_embeds`` rebases by it, and every chunk of the request inherits it.
+    mm_skipped_rows: int = 0
 
     # --- hybrid-radix (GDN linear-state) per-request slots; None for non-hybrid models or
     # until allocated from LinearStatePool. Set by the scheduler (P2). ---

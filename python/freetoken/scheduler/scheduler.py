@@ -558,7 +558,7 @@ class Scheduler(SchedulerIOMixin):
             )
         return None
 
-    def _attach_mm_embeds(self, msg: UserMsg) -> ErrorReplyMsg | None:
+    def _attach_mm_embeds(self, msg: UserMsg, skip_images: int = 0) -> ErrorReplyMsg | None:
         """Run the vision tower for an admitted image prompt; returns the client's error, or None.
 
         This is where the pixels the tokenizer worker sent become soft-token embeddings, on the
@@ -573,6 +573,11 @@ class Scheduler(SchedulerIOMixin):
         ⛔ The ``except`` below is still the only early return here whose outcome can differ per
         rank, so it is still #871's TP>1 desync. 0018 makes it far less likely to be reached;
         removing it needs the all-rank failure agreement ``scheduler.py`` names as deferred.
+
+        ⭐ #892 (patch 0019): ``skip_images`` is the LEADING run of images the prefix match taken
+        at admission already holds. The caller passes the reservation's count; k == N never
+        arrives here (the reservation answers ``holds_every_image`` and the encode is skipped
+        outright), because the tower cannot be asked for a zero-row result of its own hidden size.
         """
         encode = getattr(self.engine.model, "encode_images", None)
         if encode is None:
@@ -593,6 +598,7 @@ class Scheduler(SchedulerIOMixin):
                 msg.image_position_ids,
                 self.device,
                 msg.image_patch_counts,
+                skip_images=skip_images,
             )
         except Exception as exc:  # noqa: BLE001 -- one bad image must not take the engine down
             logger.warning_rank0("vision encode failed for request %d: %r", msg.uid, exc)
@@ -649,19 +655,21 @@ class Scheduler(SchedulerIOMixin):
                 logger.warning_rank0(
                     f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
                 )
+            reservation = None
             if msg.pixel_values is not None or msg.mm_embeds is not None:
                 # The ceiling binds both arrivals; only the pixels still need the tower run.
+                # ⚠ It refuses BEFORE anything below reserves, so a refused request never holds
+                # a lock to give back.
                 error = self._multimodal_ceiling_error(msg)
                 if error is None and msg.pixel_values is not None:
-                    error = self._attach_mm_embeds(msg)
-                if error is not None:
-                    self.send_result([error])
-                    return
-                if msg.pixel_values is not None:
                     # The prefix-cache key stream: real ids with each picture's first placeholders
                     # replaced by pixel-hash markers, so a session with a picture in it keeps its
                     # prefix and a different picture can never hit the first one's KV. Derived on
                     # every rank from the same pixels; None keeps the old bypass (mm_key.py).
+                    # ⭐ #892 (patch 0019): derived HERE, above the tower run, because the match
+                    # keys on it and the whole point of the patch is to know the match BEFORE
+                    # the tower runs. It reads only the pixels, so hoisting it changes nothing
+                    # about the key itself.
                     from freetoken.scheduler.mm_key import image_cache_key_ids
 
                     msg.cache_key_ids = image_cache_key_ids(
@@ -674,6 +682,29 @@ class Scheduler(SchedulerIOMixin):
                             "request %d: image prompt without a derivable cache key "
                             "(placeholder runs != images); prefix cache bypassed", msg.uid,
                         )
+                    # ⭐⭐ #892: match the prefix and LOCK it, then run the tower on what the
+                    # match does not already hold. llama.cpp has skipped this encode since it
+                    # began keying chunks by hash; #843 priced FreeToken's re-encode at 0.27 s
+                    # per image per turn, linear in N.
+                    reservation = self.prefill_manager.reserve_prefix(msg)
+                    if reservation is not None and reservation.holds_every_image:
+                        # ⛔ k == N: the tower has nothing to run, and must not be asked for a
+                        # zero-row result of its own hidden size. Sound because no placeholder
+                        # falls in the extend region -- no chunk asks for a row -- and the
+                        # request still has a KEY, so this is not the #791 cache bypass.
+                        msg.mm_embeds = None
+                    else:
+                        error = self._attach_mm_embeds(
+                            msg,
+                            skip_images=0 if reservation is None else reservation.skip_images,
+                        )
+                if error is not None:
+                    # #892: the request never becomes one, so its reservation gives the lock
+                    # back here -- nothing downstream will, there being no Req yet.
+                    self.prefill_manager.release_reservation(reservation)
+                    self.send_result([error])
+                    return
+                if msg.pixel_values is not None:
                     # ⭐ #890: the pixels have done both jobs they came for -- the tower has run
                     # and the cache key is derived -- and `add_one_req` never carries them into
                     # `PendingReq`. Dropping the reference here bounds the SCHEDULER's host peak
@@ -685,7 +716,7 @@ class Scheduler(SchedulerIOMixin):
                     msg.pixel_values = None
                     msg.image_position_ids = None
                     msg.image_patch_counts = None
-            self.prefill_manager.add_one_req(msg)
+            self.prefill_manager.add_one_req(msg, reservation)
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)
             tombstones = getattr(self, "_abort_tombstones", None)

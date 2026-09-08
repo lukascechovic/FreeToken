@@ -8,7 +8,7 @@ import torch
 if TYPE_CHECKING:
     from freetoken.core import SamplingParams
 
-    from .prefill import ChunkedReq
+    from .prefill import ChunkedReq, PrefixReservation
 
 
 @dataclass
@@ -20,6 +20,10 @@ class PendingReq:
     mm_embeds: torch.Tensor | None = None
     # Prefix-cache key stream for an image request (scheduler/mm_key.py); None = real ids.
     cache_key_ids: torch.Tensor | None = None
+    # #892 (patch 0019): the prefix match this request was ADMITTED on, taken and locked before
+    # the vision tower ran so the images it covers could be left unencoded. None for every text
+    # request and for any image request with nothing to skip -- those match at prefill as before.
+    reservation: PrefixReservation | None = None
 
     @property
     def input_len(self) -> int:

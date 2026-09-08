@@ -65,12 +65,21 @@ def encode_one_at_a_time(
     position_ids: torch.Tensor,
     device: torch.device | str,
     patch_counts: Sequence[int] | None = None,
+    skip_images: int = 0,
 ) -> torch.Tensor:
-    """``encode`` each image alone; returns the request's ``[sum(soft), hidden]`` embeddings.
+    """``encode`` each image alone; returns ``[sum(soft), hidden]`` for the images NOT skipped.
 
     Only one image's pixels are on the device at a time: the previous iteration's slice drops its
     last reference at the top of the next one, so torch's caching allocator can hand the same
     block back instead of growing to hold the whole request.
+
+    ⭐ #892 (patch 0019): ``skip_images`` drops the first *k* images -- the LEADING RUN a prefix
+    match already holds (``mm_key.cached_leading_images``). llama.cpp has skipped this encode
+    since it began keying chunks by hash; FreeToken re-ran the whole tower on every image in
+    every turn, at #843's 0.27 s per image per turn. ⛔ The skipped images' patches are still in
+    the batch -- 0019 skips the ENCODE, not the shipping, and the whole-batch validation below
+    stays whole-batch for exactly that reason. The rows returned are the TAIL of the full-request
+    result, in prompt order, because everything downstream consumes them positionally.
     """
     counts = split_patch_counts(position_ids, patch_counts)
     if not counts:
@@ -81,9 +90,20 @@ def encode_one_at_a_time(
             f"patch counts total {sum(counts)} but the packed batch holds "
             f"{int(position_ids.shape[0])} patches"
         )
+    if skip_images >= len(counts):
+        # ⛔ There is no honest empty result to return: the hidden size is the TOWER's and the
+        # tower never ran. A caller whose every image is inside the matched prefix must skip the
+        # encode entirely -- which is sound, because then no placeholder falls in the extend
+        # region either (scheduler.py, patch 0019).
+        raise ValueError(
+            f"every image in this request is already held by the prefix cache "
+            f"(skip_images={skip_images} of {len(counts)}); skip the encode instead of asking "
+            f"for a zero-row result"
+        )
     outputs: list[torch.Tensor] = []
-    offset = 0
-    for index, count in enumerate(counts):
+    offset = sum(counts[:skip_images])
+    for index in range(skip_images, len(counts)):
+        count = counts[index]
         if packed:
             pixels = pixel_values[offset : offset + count]
             pos = position_ids[offset : offset + count]

@@ -54,6 +54,35 @@ def placeholder_runs(input_ids: torch.Tensor, image_token_id: int) -> List[Tuple
     return [(s, e - s + 1) for s, e in zip(starts, ends)]
 
 
+def cached_leading_images(
+    input_ids: torch.Tensor, image_token_id: int | None, cached_len: int
+) -> Tuple[int, int]:
+    """``(n_images, n_rows)`` that a matched prefix ``[0, cached_len)`` ALREADY HOLDS.
+
+    ⭐ #892 (patch 0019). "Is this image's KV already held?" is not an image-keyed question --
+    an image's KV is reusable only as part of a *matching prefix* -- so the answer is read off
+    the prefix match, and because the match is a prefix the images it covers are exactly a
+    LEADING RUN. That makes the verdict per image and the skip a leading slice of the request's
+    images, which is what ``encode_one_at_a_time`` and ``slice_mm_embeds`` can both act on.
+
+    ⛔ A run that STRADDLES ``cached_len`` is NOT held: the chunk carrying its tail still
+    consumes that image's rows, so it must be encoded whole -- and it stops the verdict for
+    every image after it, which the prefix property makes free rather than conservative.
+
+    ``n_rows`` counts PLACEHOLDERS, which is one row of ``mm_embeds`` each: the model scatters
+    positionally, one soft token per placeholder (``models/qwen4_exp/model.py:119-125``).
+    """
+    if image_token_id is None or cached_len <= 0:
+        return 0, 0
+    n_images = n_rows = 0
+    for start, length in placeholder_runs(input_ids, image_token_id):
+        if start + length > cached_len:
+            break
+        n_images += 1
+        n_rows += length
+    return n_images, n_rows
+
+
 def image_digest(pixels: torch.Tensor, position_ids: torch.Tensor) -> bytes:
     """8-byte digest of ONE image's valid patches (``position_ids`` row -1 marks padding).
 

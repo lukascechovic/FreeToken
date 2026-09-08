@@ -44,6 +44,7 @@ def slice_mm_embeds(
     cached_len: int,
     chunk_size: int,
     is_last_chunk: bool,
+    skipped_rows: int = 0,
 ) -> torch.Tensor:
     """The rows of ``mm_embeds`` whose placeholders fall in ``[cached_len, cached_len+chunk)``.
 
@@ -63,16 +64,78 @@ def slice_mm_embeds(
     found its slot. The tokenizer worker checks that equality at ingest, the offline API
     (``LLM.encode_images``) does not, and without this a surplus row would be dropped silently
     -- each chunk's own count matches, so neither model assert would ever see it.
+
+    ⭐ #892 (patch 0019): ``skipped_rows`` is how many LEADING rows are not in ``mm_embeds`` at
+    all, because the prefix cache already held those images and the tower was never run on them
+    (``mm_key.cached_leading_images`` -> ``mm_encode.encode_one_at_a_time``). The positional
+    count above is over the WHOLE prompt, so it is rebased by that many rows -- and the books
+    then close on what was ENCODED rather than on what the prompt contains.
     """
     is_slot = input_ids[: cached_len + chunk_size] == image_token_id
-    start = int(is_slot[:cached_len].sum())
+    start = int(is_slot[:cached_len].sum()) - skipped_rows
     end = start + int(is_slot[cached_len:].sum())
     rows = mm_embeds.shape[0]
+    # ⛔ Unreachable by construction -- the skip was decided from a match every chunk of this
+    # request starts at or after -- but asserted rather than argued: a negative start would
+    # index from the END of the tensor and serve one picture's soft tokens into another's
+    # placeholders, with nothing erroring.
+    assert start >= 0, (
+        f"chunk at {cached_len} reaches below the images that were skipped "
+        f"({skipped_rows} rows): the prefix match this request was admitted on has shrunk"
+    )
     assert end <= rows, f"image-token slots ({end}) exceed vision features ({rows})"
     assert not is_last_chunk or end == rows, (
         f"vision features ({rows}) exceed image-token slots ({end}) over the whole prompt"
     )
     return mm_embeds[start:end]
+
+
+@dataclass
+class PrefixReservation:
+    """A prefix match taken at ADMISSION, and LOCKED there (llm-server #892, patch 0019).
+
+    ⛔ "Is this image's KV already held?" is not an image-keyed question -- an image's KV is
+    reusable only as part of a *matching prefix* -- so the check IS the prefix match, and the
+    tower can only be skipped if the match is known before the tower runs. Taken at admission a
+    match is a PREDICTION: nothing bounds the admission -> prefill window (``scheduler/`` reads
+    no ``--max-running-requests``), and a match that has shrunk by prefill fires the
+    ``slice_mm_embeds`` assert -- a crash, not a degradation. The lock is what turns the
+    prediction into a fact, and it is therefore not optional and cannot be deferred.
+
+    ⚠ The mirror cost, recorded rather than hedged: the request is committed to the match it
+    locked, so a LONGER prefix that appears between admission and prefill is not taken.
+
+    The lock is owned by the reservation from ``PrefillManager.reserve_prefix`` until either the
+    request is admitted (``PrefillAdder.try_add_one`` clears it; the ``Req`` owns the handle from
+    then on, freed by ``cache_req`` / ``_free_req_resources``) or it is released
+    (``PrefillManager.release_reservation``, on abort and on a failed encode).
+    """
+
+    handle: BaseCacheHandle
+    mamba_value: int | None
+    # How many LEADING images this match already holds, and how many soft-token rows they own
+    # (``mm_key.cached_leading_images``). The first is what the tower skips, the second what
+    # ``slice_mm_embeds`` rebases by.
+    skip_images: int
+    skipped_rows: int
+    # Every image in the request, so ``skip_images`` can be read as "all of them" -- see
+    # ``holds_every_image``.
+    total_images: int = 0
+
+    @property
+    def cached_len(self) -> int:
+        return self.handle.cached_len
+
+    @property
+    def holds_every_image(self) -> bool:
+        """⛔ The k == N case, which the caller must not hand to the tower at all.
+
+        ``encode_one_at_a_time`` REFUSES it rather than answer with a guessed shape: the hidden
+        size is the tower's and the tower never ran. Skipping the encode outright is sound
+        because with every image inside the match no placeholder falls in the extend region, so
+        no chunk asks for a row -- the scheduler sets ``mm_embeds = None`` instead.
+        """
+        return self.total_images > 0 and self.skip_images >= self.total_images
 
 
 @dataclass
@@ -89,13 +152,32 @@ class PrefillAdder:
     # one. Needed to hand each chunk of a multimodal prompt its own rows (slice_mm_embeds).
     image_token_id: int | None = None
 
+    def _refuse(self, handle: BaseCacheHandle, reservation: PrefixReservation | None):
+        """Refuse admission this pass (returns None, so callers can ``return`` it).
+
+        ⛔ A RESERVED handle keeps its lock. The reservation owns it from admission, the request
+        stays pending, and the retry must land on exactly the match the encode was skipped
+        against -- dropping the lock here would leave that retry trusting an unlocked handle.
+        """
+        if reservation is None:
+            self.cache_manager.unlock(handle)
+        return None
+
     def _try_allocate_one(self, req: PendingReq):
         if self.table_manager.available_size == 0:
             return None
 
-        # TODO: consider host cache match case
-        mr = self.cache_manager.match_req(req)
-        handle = mr.cuda_handle
+        # ⭐ #892 (patch 0019): an image request whose leading images were left unencoded matched
+        # and LOCKED its prefix at admission (PrefillManager.reserve_prefix); re-matching here
+        # would be a correctness bug, not a wasted lookup -- a LONGER match would make
+        # slice_mm_embeds skip rows that WERE encoded. Everything else matches here as before.
+        reservation = getattr(req, "reservation", None)
+        if reservation is None:
+            # TODO: consider host cache match case
+            mr = self.cache_manager.match_req(req)
+            handle, mamba_value = mr.cuda_handle, mr.mamba_value
+        else:
+            handle, mamba_value = reservation.handle, reservation.mamba_value
         cached_len = handle.cached_len
         # TODO: better estimate policy
         extend_len = req.input_len - cached_len
@@ -103,9 +185,10 @@ class PrefillAdder:
 
         if estimated_len + self.reserved_size > self.cache_manager.available_size:
             return None
-        self.cache_manager.lock(handle)
+        if reservation is None:
+            self.cache_manager.lock(handle)
         if estimated_len + self.reserved_size > self.cache_manager.available_size:
-            return self.cache_manager.unlock(handle)
+            return self._refuse(handle, reservation)
 
         # Second currency (hybrid GDN): reserve 1 live + 2 ping-pong state slots; evict tree
         # snapshots if the pool is short, fail admission if still short (mirrors the KV gate).
@@ -114,7 +197,7 @@ class PrefillAdder:
             if pool.num_free_slots < 3:
                 self.cache_manager.ensure_mamba_slots(3)
             if pool.num_free_slots < 3:
-                return self.cache_manager.unlock(handle)
+                return self._refuse(handle, reservation)
 
         # Third currency (SWA): refuse admission unless the swa pool can seat this request's first
         # chunk / one window (the per-chunk charge is in _add_one_req; the reclaim -- radix
@@ -128,7 +211,7 @@ class PrefillAdder:
                 min(max(extend_len, 1), self.cache_manager.sliding_window_size) + 1, ps
             ) * ps
             if self.cache_manager.swa_available_size - self.reserved_swa < need_swa:
-                return self.cache_manager.unlock(handle)
+                return self._refuse(handle, reservation)
 
         table_idx = self.table_manager.allocate()
         if cached_len > 0:  # NOTE: set the cached part
@@ -149,7 +232,7 @@ class PrefillAdder:
             linear_slot_idx = pool.alloc(1)[0]
             ping_pong = tuple(pool.alloc(2))
 
-        return handle, table_idx, linear_slot_idx, ping_pong, mr.mamba_value
+        return handle, table_idx, linear_slot_idx, ping_pong, mamba_value
 
     def _add_one_req(
         self,
@@ -163,6 +246,7 @@ class PrefillAdder:
         last_track_seqlen: int | None = None,
         restore_src: int | None = None,
         swa_evicted_seqlen: int = 0,
+        skipped_rows: int = 0,
     ) -> Req | None:
         remain_len = pending_req.input_len - cached_len
         chunk_size = min(self.token_budget, remain_len)
@@ -219,7 +303,7 @@ class PrefillAdder:
             )
             mm_embeds = slice_mm_embeds(
                 pending_req.input_ids, mm_embeds, self.image_token_id, cached_len, chunk_size,
-                is_last_chunk=not is_chunked,
+                is_last_chunk=not is_chunked, skipped_rows=skipped_rows,
             )
         CLS = ChunkedReq if is_chunked else Req
         self.token_budget -= chunk_size
@@ -259,6 +343,9 @@ class PrefillAdder:
         req.mamba_last_track_seqlen = last_track_seqlen
         req.mamba_restore_src = restore_src
         req.swa_evicted_seqlen = swa_evicted_seqlen  # carry the extend-free watermark across chunks
+        # #892 (patch 0019): carried across the seam like the hybrid fields above -- every chunk
+        # slices from the SAME encoded rows, so every chunk needs the same rebase.
+        req.mm_skipped_rows = skipped_rows
         return req
 
     def try_add_one(self, pending_req: PendingReq) -> Req | None:
@@ -278,10 +365,12 @@ class PrefillAdder:
                 last_track_seqlen=chunked_req.mamba_last_track_seqlen,
                 restore_src=None,  # continuation chunk already has live state
                 swa_evicted_seqlen=chunked_req.swa_evicted_seqlen,  # extend-free watermark so far
+                skipped_rows=chunked_req.mm_skipped_rows,  # same encoded rows, same rebase
             )
 
         if resource := self._try_allocate_one(pending_req):
             cache_handle, table_idx, linear_slot_idx, ping_pong, restore_src = resource
+            reservation = getattr(pending_req, "reservation", None)
             req = self._add_one_req(
                 pending_req=pending_req,
                 cache_handle=cache_handle,
@@ -291,14 +380,21 @@ class PrefillAdder:
                 ping_pong=ping_pong,
                 next_track_idx=0,
                 restore_src=restore_src,
+                skipped_rows=0 if reservation is None else reservation.skipped_rows,
             )
             if req is None:
                 # no aligned chunk this pass: undo the admission (a continuation keeps its
-                # resources -- they belong to the prior chunk's Req)
-                self.cache_manager.unlock(cache_handle)
+                # resources -- they belong to the prior chunk's Req, and a RESERVED handle keeps
+                # its lock for the retry -- see _refuse)
+                self._refuse(cache_handle, reservation)
                 self.table_manager.free(table_idx)
                 if linear_slot_idx is not None:
                     self.cache_manager.linear_state_pool.free([linear_slot_idx, *ping_pong])
+            elif reservation is not None:
+                # #892: admitted. The Req owns the matched handle's lock from here, on the same
+                # lifecycle every other request's handle has (cache_req / _free_req_resources),
+                # so the reservation must not release it a second time.
+                pending_req.reservation = None
             return req
 
         return None
@@ -313,11 +409,49 @@ class PrefillManager:
     # See PrefillAdder.image_token_id; the scheduler reads it off the model config.
     image_token_id: int | None = None
 
-    def add_one_req(self, req: UserMsg) -> None:
+    def reserve_prefix(self, msg: UserMsg) -> PrefixReservation | None:
+        """Match this image request's prefix BEFORE the vision tower runs, and lock it.
+
+        ⭐ #892 (patch 0019). Returns None -- keeping today's match-at-prefill path exactly -- for
+        every request that would gain nothing: a text request, an image request with no derivable
+        key (the #791 bypass), and an image request whose match holds no whole leading image.
+        ⚠ That is decision 2 of the round: only a request that will actually skip an encode holds
+        a tree lock across the pending window.
+        """
+        if msg.cache_key_ids is None or self.image_token_id is None:
+            return None
+        from freetoken.scheduler.mm_key import cached_leading_images, placeholder_runs
+
+        # The match keys on the marker stream, so the probe carries it and nothing else: no
+        # mm_embeds, because "carries an image" without a key is the BYPASS (cache._mm_bypass)
+        # and this path is only ever reached with a key.
+        probe = PendingReq(
+            msg.uid, msg.input_ids, msg.sampling_params, cache_key_ids=msg.cache_key_ids
+        )
+        mr = self.cache_manager.match_req(probe)
+        handle = mr.cuda_handle
+        skip_images, skipped_rows = cached_leading_images(
+            msg.input_ids, self.image_token_id, handle.cached_len
+        )
+        if skip_images == 0:
+            return None
+        self.cache_manager.lock(handle)
+        return PrefixReservation(
+            handle=handle, mamba_value=mr.mamba_value,
+            skip_images=skip_images, skipped_rows=skipped_rows,
+            total_images=len(placeholder_runs(msg.input_ids, self.image_token_id)),
+        )
+
+    def release_reservation(self, reservation: PrefixReservation | None) -> None:
+        """Give a reservation's lock back when its request never becomes one."""
+        if reservation is not None:
+            self.cache_manager.unlock(reservation.handle)
+
+    def add_one_req(self, req: UserMsg, reservation: PrefixReservation | None = None) -> None:
         self.pending_list.append(
             PendingReq(
                 req.uid, req.input_ids, req.sampling_params, mm_embeds=req.mm_embeds,
-                cache_key_ids=req.cache_key_ids,
+                cache_key_ids=req.cache_key_ids, reservation=reservation,
             )
         )
 
@@ -374,6 +508,15 @@ class PrefillManager:
         for i, req in enumerate(self.pending_list):
             if req.uid == uid:
                 self.pending_list.pop(i)
+                # ⭐ #892 (patch 0019): a reservation that never became a request gives its lock
+                # back HERE, because nothing downstream will -- before admission there is no
+                # ``Req`` to free, and the None returned below is what the scheduler acts on.
+                # ⛔ Not a double release: ``try_add_one`` clears ``pending_req.reservation`` at
+                # admission precisely so this pop cannot unlock the handle the ``Req`` now owns
+                # (a chunked continuation is exactly that case -- it is still in ``pending_list``,
+                # and it is returned below for ``_free_req_resources`` to free).
+                self.release_reservation(req.reservation)
+                req.reservation = None
                 return req.chunked_req
         return None
 
