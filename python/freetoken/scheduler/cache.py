@@ -421,13 +421,28 @@ class CacheManager:
         L = req.mamba_last_track_seqlen
         if L is None:
             return  # no ×64 boundary crossed this chunk; req keeps its pages (committed later)
+        if not (old_handle.cached_len < L <= req.cached_len):
+            # #903 (patch 0021): since the boundary is carried across chunk seams, L can be older
+            # than this forward -- so state the window it must sit in instead of inheriting it.
+            # UPPER: insert() reads `page_indices[:L]` off a row only `req.cached_len` long, and
+            # the state must not encode more tokens than are committed. LOWER: below the handle's
+            # own prefix the re-point and the `_free` slice below invert, and `unlock(old_handle)`
+            # would drop the longer lock for a shorter one under a request whose page-table row
+            # still names those pages. Both hold by construction for a carried boundary (an
+            # earlier chunk of THIS turn tracked at >= its own start + CHUNK, and every chunk
+            # starts at or after the admission match) -- this makes them enforced, not argued.
+            req.mamba_last_track_seqlen = None
+            return
         if align_down(L, self.page_size) != L:
             # page_size>1 only: insert would align the key down, attaching a state that encodes
             # L tokens to a SHORTER node -- a future hit would COW-restore an over-advanced
             # state. Skip; the next aligned boundary (or the finish-donate) commits instead.
             req.mamba_last_track_seqlen = None
             return
-        frozen_idx = 1 - req.mamba_next_track_idx          # the slot the forward just wrote
+        # The slot the last TRACKING forward wrote -- this chunk's, or an earlier chunk's carried
+        # across the seam (#903). `mamba_last_track_seqlen` and `mamba_next_track_idx` are only
+        # ever set together, so the pair still names the state captured at exactly L.
+        frozen_idx = 1 - req.mamba_next_track_idx
         frozen = req.mamba_ping_pong[frozen_idx]
         prefix_len, mamba_exist = self.prefix_cache.insert(
             _cache_ids(req)[:L], page_indices[:L], frozen)
