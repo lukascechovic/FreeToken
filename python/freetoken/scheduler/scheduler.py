@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
 import torch
@@ -570,9 +571,12 @@ class Scheduler(SchedulerIOMixin):
         before the tower could split anything, which ``FREETOKEN_VIT_GROUP=1`` cannot reach
         because it is downstream of the copy. See ``scheduler/mm_encode.py``.
 
-        ⛔ The ``except`` below is still the only early return here whose outcome can differ per
-        rank, so it is still #871's TP>1 desync. 0018 makes it far less likely to be reached;
-        removing it needs the all-rank failure agreement ``scheduler.py`` names as deferred.
+        ⭐⭐ #871 (patch 0022): the ``except`` below is the only early return here whose outcome
+        can differ per rank -- it depends on that rank's card at that instant, not on the request.
+        It no longer changes control flow on its own: every rank all-reduces its own outcome and
+        acts on the agreed one, so a per-rank OOM is a refused request on a live row, which is
+        what the ``noqa`` comment always intended. 0018 made it far less likely to be REACHED;
+        this is what makes reaching it survivable.
 
         ⭐ #892 (patch 0019): ``skip_images`` is the LEADING run of images the prefix match taken
         at admission already holds. The caller passes the reservation's count; k == N never
@@ -590,7 +594,9 @@ class Scheduler(SchedulerIOMixin):
                 code="invalid_request_error",
             )
         from freetoken.scheduler.mm_encode import encode_one_at_a_time
+        from freetoken.scheduler.rank_agreement import any_rank_failed
 
+        local_error: ErrorReplyMsg | None = None
         try:
             msg.mm_embeds = encode_one_at_a_time(
                 encode,
@@ -601,13 +607,109 @@ class Scheduler(SchedulerIOMixin):
                 skip_images=skip_images,
             )
         except Exception as exc:  # noqa: BLE001 -- one bad image must not take the engine down
-            logger.warning_rank0("vision encode failed for request %d: %r", msg.uid, exc)
-            return ErrorReplyMsg(
+            # ⛔ NOT `warning_rank0`. This is the one event in this path that happens on ONE card,
+            # so rank-0 gating means a rank-1 OOM is logged NOWHERE -- and that is precisely the
+            # case whose cause would otherwise be unrecoverable. #871 was rank 0, which is the
+            # only reason it was diagnosable at all. The formatter already carries `rank=N`.
+            logger.warning("vision encode failed for request %d: %r", msg.uid, exc)
+            local_error = ErrorReplyMsg(
                 uid=msg.uid,
                 error=f"could not encode the image: {exc}",
                 code="invalid_request_error",
             )
-        return None
+        # ⭐⭐ #871 (patch 0022): AGREE, THEN ACT. Every branch above this line is decided by the
+        # request and is therefore identical on every rank; the `except` is not, and a rank that
+        # refuses alone leaves its peer blocked in the embedding all-reduce until NCCL's watchdog
+        # takes the process down 60 s later. ⛔ Both outcomes reduce -- a collective reached only
+        # on failure would be the same desync moved one function earlier.
+        if not any_rank_failed(
+            local_error is not None, self.config.tp_info.size, self._reduce_failure_flag
+        ):
+            return None
+        if local_error is not None:
+            return local_error
+        # This rank's encode succeeded and a peer's did not. Say so: without this line, this
+        # rank's log shows a refusal with no cause on it, and reading the two ranks side by side
+        # is how a desync gets diagnosed at all.
+        logger.warning(
+            "request %d refused in agreement: this rank encoded its images, another rank did not",
+            msg.uid,
+        )
+        # Drop the embeddings before refusing:
+        # the tower's output is on the card, the request never becomes a `Req`, and so nothing
+        # downstream will ever free it -- while the retry this refusal invites needs that room.
+        msg.mm_embeds = None
+        return ErrorReplyMsg(
+            uid=msg.uid,
+            error=(
+                "could not encode the image: another tensor-parallel rank failed to encode it "
+                "(most often that card was momentarily out of memory); retry"
+            ),
+            code="invalid_request_error",
+        )
+
+    def _reduce_failure_flag(self, flag: torch.Tensor) -> None:
+        """MAX all-reduce the agreement flag, in place, over the TP CPU group — with a deadline.
+
+        ⭐ `tp_cpu_group` is gloo in BOTH branches of `engine._init_communication`, so this never
+        touches the NCCL path. `scheduler/io.py`'s receive loop already broadcasts over the same
+        group every iteration, which is what prices this as cheap.
+
+        ⭐⭐ #871 (patch 0022), bullet 5. The group this runs on does NOT carry the row's own
+        timeout. On the served TP=2 path `engine._init_communication` builds it with
+        `new_group(backend="gloo")` and no `timeout=`, so it takes torch's default —
+        `default_pg_timeout`, measured at **30 minutes** on the pinned torch (2.11.0+rocm7.14.0),
+        not the `distributed_timeout: float = 60.0` that the process group beside it was
+        initialised with (`engine/config.py`; ⛔ that field has no CLI flag). The wait below
+        carries that 60 s explicitly. It is the same field NCCL's watchdog is armed with, so a
+        peer this rank gives up on is one the watchdog would have given up on too — and 60 s is
+        three orders of magnitude more than a small host all-reduce needs, while the encode that
+        can delay a peer's arrival runs one image at a time (patch 0018) on a soft-token-capped
+        row.
+
+        ⭐ Both failure shapes end the same way — a logged refusal:
+
+        - a peer that is **gone** raises immediately (gloo: `Connection closed by peer`) -- at the
+          enqueue or at the wait, so BOTH are inside the guard -- which
+          without this `except` would leave `_process_one_msg` and then `run_forever` — which
+          catches `KeyboardInterrupt` and nothing else — killing this rank on a traceback that
+          reads as a distributed bug rather than as the peer's death;
+        - a peer that is **hung** raises `Operation timed out!` at the deadline instead of
+          parking this rank for the half hour.
+
+        ⛔ Fail CLOSED. On any error this rank marks the request failed, which is the only safe
+        answer: an all-reduce is symmetric, so a peer that did not answer this one is not
+        entering the forward on the strength of it either, and refusing can never leave a rank
+        in the forward alone — which is the whole of #871.
+
+        ⚠ This is belt-and-braces, not correctness. After bullets 1–4 a rank can reach the
+        agreement and fail to be met only if its peer died hard, and the backend supervisor
+        already reports that (`Backend supervisor: backend worker exited`). ⛔ Nor does a fired
+        deadline repair the group: the abandoned all-reduce stays queued in gloo, so a peer that
+        arrived late would match THIS op and leave every later collective one behind. That is
+        acceptable only because the deadline is unreachable unless the peer is already gone.
+        This converts a silent park into a logged refusal on the way down; it is not a recovery.
+        """
+        deadline = self.config.distributed_timeout
+        try:
+            # ⛔ The ENQUEUE is inside the guard, not just the wait. A peer that is already gone
+            # can surface from `all_reduce` ITSELF, before there is a handle to wait on, and an
+            # error escaping here reaches `run_forever` exactly as an escaping wait would --
+            # making 0022 the new way to lose the row that this `except` exists to prevent.
+            work = torch.distributed.all_reduce(
+                flag, op=torch.distributed.ReduceOp.MAX, group=self.tp_cpu_group, async_op=True
+            )
+            work.wait(timedelta(seconds=deadline))
+        except Exception as exc:  # noqa: BLE001 -- a peer that never answers must not raise here
+            # ⛔ NOT `warning_rank0`: which rank lost its peer is the whole content of the line,
+            # and rank 1 losing rank 0 would otherwise be logged nowhere (bullet 3's principle).
+            logger.error(
+                "no answer from a tensor-parallel peer on the vision failure agreement "
+                "(deadline %.1fs): %r -- refusing the request",
+                deadline,
+                exc,
+            )
+            flag.fill_(1)
 
     def _process_one_msg(self, msg: BaseBackendMsg) -> None:
         if isinstance(msg, BatchBackendMsg):

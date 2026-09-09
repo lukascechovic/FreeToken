@@ -696,6 +696,9 @@ def _scheduler(pm, tower, *, prompt_limit=None):
     sch.config = SimpleNamespace(
         image_soft_token_limit=lambda: None,
         multimodal_prompt_limit=lambda: prompt_limit,
+        # #871 patch 0022: `_attach_mm_embeds` agrees its outcome across ranks. TP=1 never
+        # reaches the collective, so this rig needs the field and no group.
+        tp_info=SimpleNamespace(size=1, rank=0),
     )
     sch.device = "cpu"
     sch.prefill_manager = pm
