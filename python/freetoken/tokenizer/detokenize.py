@@ -4,6 +4,45 @@ from typing import Dict, FrozenSet, List
 from freetoken.message import DetokenizeMsg
 from transformers import PreTrainedTokenizerBase
 
+# ── #801 overlay marker ──────────────────────────────────────────────────────────────────────
+# This file is `tokenizer/detokenize.py` from image
+# `llm-server/freetoken-gfx1201:2026-09-09-agree-0022` (md5 3d20c1e8e4b3244040f433f5588addad,
+# 147 lines) plus ONE edit: `DetokenizeManager.detokenize` is now a dispatcher that runs the
+# image's own body once per ROUND, and that body is the image's `detokenize` renamed to
+# `_ft801_detokenize_round`, byte for byte. ⛔ In no image, in no Dockerfile ladder:
+# `arm_mtp_801.sh`'s OVERLAY and ORIGS lists or the tokenizer worker runs the image's copy
+# silently (#866). The differential is gated by `test_detokenize_801.py`, on the HOST.
+#
+# ⛔⛆ WHY THE TOKENIZER WORKER IS TOUCHED AT ALL, AND WHY NINETEEN LOADS WALKED PAST IT.
+#   `detokenize` takes a LIST. Its first loop appends every message's token and slices the ids
+#   with `surr_offset`/`read_offset`; the SECOND loop is what advances those two offsets. At one
+#   message per uid per batch that is correct -- and one message per uid per batch is exactly what
+#   a one-token-per-step engine produces. It is the image's own invariant, and nothing in the
+#   image states it. #801's verify step commits 1 OR 2 tokens per request per forward and
+#   `scheduler.py`'s drain ships them in ONE reply list, so the second message is sliced against
+#   the FIRST message's pre-append offsets and its `new_text` re-includes the first token:
+#       control  'We need to respond to user:'
+#       verify   'We need to respond respond to user user:'
+#   ⭐⭐⭐ That is load 19's warmup to the byte, and THE COMMIT PATH WAS RIGHT THE WHOLE TIME. One
+#   reply goes out per message either way (`tokenizer/server.py` stamps `completion_tokens_delta=1`
+#   per message and zips `strict=True`), which is why the load reported 61 chunks and 61 completion
+#   tokens while the text inside them carried ~86 tokens' worth -- the duplication rides INSIDE a
+#   reply, where no count can see it.
+#
+# ⭐ IDENTICAL FOR AN ENGINE THAT COMMITS ONE TOKEN A STEP: such a batch holds at most one message
+#   per uid, which is ONE round, which is the image's body called once on the whole list. Gated
+#   reply-for-reply against the `.orig` over seven batch shapes rather than argued.
+import os as _ft801_os
+import sys as _ft801_sys
+
+print(
+    "[#801] overlay ACTIVE: tokenizer/detokenize.py bind-mounted from the repo "
+    f"(pid {_ft801_os.getpid()}, base md5 3d20c1e8e4b3244040f433f5588addad, "
+    f"FREETOKEN_MTP801_VERIFY={_ft801_os.getenv('FREETOKEN_MTP801_VERIFY', '<unset>')})",
+    file=_ft801_sys.stderr,
+    flush=True,
+)
+
 # Borrowed from sglang
 
 
@@ -73,6 +112,33 @@ class DecodeStatus:
     sent_offset: int  # length of sent out string
 
 
+def _ft801_rounds_by_uid(msgs: List[DetokenizeMsg]) -> List[List[int]]:
+    """``msgs`` split into rounds of INDICES, each round holding at most one message per uid.
+
+    ⭐ A uid's k-th message lands in round k: every earlier round already holds that uid, and the
+    first round that does not is the one it joins. So a request's tokens keep their order, and two
+    requests never wait on each other -- a round fills up with DISTINCT uids, so a batch of plain
+    decode rows is still one round however wide it is.
+
+    ⚠ Indices, not messages. The caller owes one reply per message IN THE ORDER IT WAS GIVEN --
+    `tokenizer/server.py` zips the replies with the messages ``strict=True`` and stamps a
+    ``completion_tokens_delta`` per pair -- and an index is what puts a round's replies back where
+    they came from.
+    """
+    rounds: List[List[int]] = []
+    seen: List[set] = []
+    for index, msg in enumerate(msgs):
+        for members, uids in zip(rounds, seen):
+            if msg.uid not in uids:
+                members.append(index)
+                uids.add(msg.uid)
+                break
+        else:
+            rounds.append([index])
+            seen.append({msg.uid})
+    return rounds
+
+
 class DetokenizeManager:
     def __init__(
         self, tokenizer: PreTrainedTokenizerBase, eos_token_ids: FrozenSet[int] | None = None
@@ -91,6 +157,32 @@ class DetokenizeManager:
         self.decode_map.pop(uid, None)
 
     def detokenize(self, msgs: List[DetokenizeMsg]) -> List[str]:
+        """One reply per message, in the order given -- the image's contract, unchanged.
+
+        ⛔⛆ THE ROUNDS ARE THE WHOLE EDIT, and the marker block at the top of this file says what
+        they are for: `_ft801_detokenize_round` below is the image's own body, and it is correct
+        only for a batch holding at most one message per uid. #801's verify step commits two
+        tokens for one request on one forward, and the drain ships both in one list.
+
+        ⚠ One `batch_decode` pair per round, not per message: a batch that never speculates is one
+        round and costs exactly what it costs today. A serving batch where every row accepted its
+        draft is two.
+        """
+        replies: List[str] = [""] * len(msgs)
+        for members in _ft801_rounds_by_uid(msgs):
+            for index, reply in zip(
+                members, self._ft801_detokenize_round([msgs[i] for i in members]), strict=True
+            ):
+                replies[index] = reply
+        return replies
+
+    def _ft801_detokenize_round(self, msgs: List[DetokenizeMsg]) -> List[str]:
+        """⛔ The image's `detokenize`, byte for byte -- NEVER call it directly.
+
+        It is correct only for ``msgs`` holding at most one message per uid; `detokenize` above is
+        what guarantees that. `test_detokenize_801.py` asserts this body against the `.orig`'s, so
+        an image bump that moves it is a failing gate rather than a silent fork.
+        """
         read_ids: List[List[int]] = []
         surr_ids: List[List[int]] = []
         for msg in msgs:

@@ -42,6 +42,24 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# ── #801 overlay marker ──────────────────────────────────────────────────────────────────────
+# This file is `scheduler/scheduler.py` from image
+# `llm-server/freetoken-gfx1201:2026-09-09-agree-0022` (md5 76293fe8d4b6e1cfd1cba38e1bb8092b,
+# 1208 lines) BIND-MOUNTED over the installed package, plus the edits marked `#801 bullet 8`
+# below. ⛔ It is NOT a patch in the Dockerfile ladder and is in NO image. ⚠ A `-v` that silently
+# does not take leaves the row running the IMAGE's scheduler while every log line looks like the
+# arm we think we launched (#866) -- hence a marker, on stderr, before logging is up.
+import os as _ft801_os
+import sys as _ft801_sys
+
+print(
+    "[#801] overlay ACTIVE: scheduler/scheduler.py bind-mounted from the repo "
+    f"(pid {_ft801_os.getpid()}, base md5 76293fe8d4b6e1cfd1cba38e1bb8092b, "
+    f"FREETOKEN_MTP801_VERIFY={_ft801_os.getenv('FREETOKEN_MTP801_VERIFY', '<unset>')})",
+    file=_ft801_sys.stderr,
+    flush=True,
+)
+
 Indice2D: TypeAlias = Tuple[torch.Tensor, torch.Tensor]
 
 
@@ -181,6 +199,13 @@ class Scheduler(SchedulerIOMixin):
     def run_when_idle(self) -> None:
         """Called when the scheduler is idle to perform background tasks."""
         logger.info_rank0("Scheduler is idle, waiting for new reqs...")
+        # ── #801 r6 b9am: flush the last request's α row before anything can raise ──────
+        try:
+            from freetoken.models.qwen4_exp.spec import drain_alpha
+
+            drain_alpha(getattr(self.engine, "model", None))
+        except Exception:  # pragma: no cover - measurement must never kill a served row
+            pass
         self.cache_manager.check_integrity()
 
     @torch.inference_mode()
@@ -342,6 +367,100 @@ class Scheduler(SchedulerIOMixin):
 
         batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
         copy_done.synchronize()
+        # #801 bullet 8: per-request token lists, once for the batch -- see the loop below.
+        _ft801_published = _ft801_published_tokens(batch, next_tokens_cpu)
+        # ── #801 r6 b9bh: the LENGTH verdict, per PUBLISHED token ──────────────────────
+        # ⛔⛆ `hit_length = not req.can_decode` read the request's LIVE `device_len`, and
+        #   `spec.commit_verify` advanced that by the WHOLE accepted pair before this drain
+        #   ran. A pair landing on the cap therefore tripped *length* on its FIRST token, the
+        #   loop below broke, and the second token was appended to `input_ids` by the tail
+        #   loop but never shipped -- load 24 measured the client one token short on seven of
+        #   nine cells. `publish_plan` judges token k against the `device_len` a one-token-per-
+        #   step row would have had at the same generated index.
+        # ⭐ MODEL-AGNOSTIC and hoisted: one `getattr` per DRAIN, not per request. A model
+        #   without the hook -- and a row with the verify dial off -- keeps `not req.can_decode`
+        #   byte for byte, which for a one-token commit is the same verdict by arithmetic.
+        _ft801_lengths_of = getattr(self.engine.model, "mtp_publish_lengths", None)
+        # ── #801 r6 b9bn: THE DRAINED FORWARD'S OWN POST-COMMIT `cached_len` ───────────────
+        # ⛔⛆ 9bh fixed the FORMULA and load 25 showed the INPUT was wrong. `req.cached_len` read
+        #   HERE is the NEXT forward's post-commit value -- `overlap_loop` forwards batch N
+        #   before draining batch N-1, so N's commit is already in the number on every row (36 of
+        #   36, load 25). Judged against it the verify arm finishes one generated token early and
+        #   the following drain hits `already_finished` and ships nothing.
+        # ⭐ `engine/engine.py::forward_batch` records the value on the batch after BOTH advance
+        #   paths, and this is the batch that forward produced -- so the tuple below belongs to
+        #   the forward being drained, whatever ran after it.
+        # ⛔ ABSENT -> the image's own `not req.can_decode`, byte for byte, exactly as a model
+        #   without `mtp_publish_lengths` already degrades. ⛔⛆ It must NOT fall back to the live
+        #   `req.cached_len`: that is the defect this line exists to remove, and it would come
+        #   back wearing the costume of a rare flake instead of an unmounted overlay.
+        _ft801_own = getattr(batch, "ft801_post_commit", None)
+        # ── #801 r6 b9bd: THE PUBLISH LEDGER, AND IT EXISTS BECAUSE LOAD 22 MEASURED THE
+        #   LEAK AND THE NEXT LINK IS STILL DERIVED ──────────────────────────────────────────
+        # ⛔⛆ Load 22's retire-time ledger caught the leaking retire in the act -- `ids_numel`
+        #   127 against `cached_len` 128, both frees EMPTY, `freed_total` 0 -- with 9az's drain
+        #   fix MOUNTED and md5-verified. ⇒ the missing id never reaches `_ft801_published[i]`
+        #   at all, and appending "the rest of the published list" cannot recover a token that
+        #   was never published. This records, per DRAINED FORWARD and per request, the two
+        #   sides of that hand-off: what `spec.commit_verify` was called with
+        #   (`staged.committed`, at `plan.cu_seqlens`), what `published_tokens` actually SLICED
+        #   out of `next_tokens_cpu`, and what reached `req.input_ids`.
+        # ⛔ MEASURE IT, DO NOT DERIVE IT. This round has now read this path's source and been
+        #   wrong twice (9ay's `insert:dedup`, 9az's fix), and load 21 proved the desk sweep's
+        #   `drain_step` does not describe the deployed drain.
+        # ⭐ MEASUREMENT-SAFE, like 9bb's ledger and unlike CHECKROW/GDNCHECK: no second
+        #   forward, no rewind, no device read, nothing that makes `can_use_cuda_graph` decline
+        #   the verify capture. It reports numbers this drain already holds. ⇒ a decode figure
+        #   off a `PUBCHECK` load MAY be banked as the arm's.
+        # ⭐ OFF BY DEFAULT, and the budget is read ONCE per Scheduler: a row that never sets the
+        #   dial pays one `getattr` per drain. `FREETOKEN_MTP801_PUBCHECK=N` counts DRAINED
+        #   FORWARDS (not retires, not steps), set by `arm_mtp_801.sh` from `FT801_PUBCHECK` --
+        #   round 5 bullet 7c's rule: a dial the launcher cannot set is off.
+        # ⛔ MODEL-AGNOSTIC, like every other hook this file carries: it reads the step the model
+        #   staged on the batch (`ft801_verify_step`), never an import from `models/qwen4_exp/`.
+        _ft801_pub = None
+        _ft801_left = getattr(self, "_ft801_pubcheck_left", None)
+        if _ft801_left is None:
+            _ft801_left = int(_ft801_os.getenv("FREETOKEN_MTP801_PUBCHECK", "0") or 0)
+        if _ft801_left > 0:
+            self._ft801_pubcheck_left = _ft801_left - 1
+            _ft801_step = getattr(batch, "ft801_verify_step", None)
+            # ⚠ Recorded as -1 rather than raised when the staged step is short: an instrument
+            #   may not kill the row it is measuring, and a -1 in the record is louder in the
+            #   log than an IndexError three frames deep.
+            _ft801_committed = list(getattr(_ft801_step, "committed", ()) or ())
+            _ft801_cu = (
+                [int(c) for c in _ft801_step.plan.cu_seqlens]
+                if _ft801_step is not None
+                else []
+            )
+            _ft801_pub = [
+                {
+                    "uid": getattr(req, "uid", None),
+                    # what `spec.commit_verify` advanced this request by, this forward
+                    "committed": (
+                        1
+                        if _ft801_step is None
+                        else (int(_ft801_committed[i]) if i < len(_ft801_committed) else -1)
+                    ),
+                    "cu": (
+                        i
+                        if _ft801_step is None
+                        else (int(_ft801_cu[i]) if i < len(_ft801_cu) else -1)
+                    ),
+                    # what `published_tokens` actually sliced out -- SHORT when the slice ran
+                    # past the end of `next_tokens_cpu`, which python does silently
+                    "published": int(_ft801_published[i].numel()),
+                    "cached_len": int(req.cached_len),
+                    "device_len": int(getattr(req, "device_len", -1)),
+                    "ids_before": int(req.input_ids.numel()),
+                    "appended": 0,
+                    "tail": 0,
+                }
+                for i, req in enumerate(batch.reqs)
+            ]
+        else:
+            self._ft801_pubcheck_left = _ft801_left
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
         with self.cache_manager.lazy_free_region():
@@ -371,42 +490,112 @@ class Scheduler(SchedulerIOMixin):
                     # are freed below/already; shipping this token would append past the
                     # client's terminal reply.
                     continue
-                next_token = next_tokens_cpu[i]
-                req.append_host(next_token.unsqueeze(0))
-                next_token = int(next_token.item())
-                # EOS / stop-string -> "stop", output budget exhausted -> "length";
-                # EOS and stop strings win over length.
-                hit_length = not req.can_decode
-                hit_eos = (
-                    not req.sampling_params.ignore_eos and next_token in self.eos_token_ids
-                )
-                matched_stop = (
-                    self._match_stop_str(req)
-                    if not hit_eos and req.sampling_params.stop_strs
-                    else None
-                )
-                finished = hit_length or hit_eos or matched_stop is not None
-                finish_reason = (
-                    ("stop" if (hit_eos or matched_stop is not None) else "length")
-                    if finished
-                    else None
-                )
-                if (
-                    next_token == self.toolcall_anchor_id
-                    and req.toolcall_anchor_len is None
-                    and not finished
-                ):
-                    req.toolcall_anchor_len = req.input_ids.numel()
-                reply.append(
-                    DetokenizeMsg(
-                        uid=req.uid,
-                        next_token=next_token,
-                        finished=finished,
-                        finish_reason=finish_reason,
-                        matched_stop=matched_stop,
-                        stop_strs=req.sampling_params.stop_strs or None,
+                # ── #801 bullet 8: one OR TWO tokens per forward ─────────────────
+                # ⛔⛆ The image reads `next_tokens_cpu[i]` with `i` the REQUEST's position. On a
+                # verify step that tensor is one row per TOKEN, so `[i]` is the wrong element for
+                # every request after the first and an accepted second token is never shipped.
+                # `_ft801_published_tokens` returns exactly what this forward COMMITTED for each
+                # request -- a plain decode batch is one token each, spelled as a one-element
+                # tensor, which is today's behaviour and today's cost.
+                # ⛔ `finished` is read AFTER this loop by the free/cache block below, so the
+                # loop `break`s on the first terminal token: an accepted pair whose FIRST token
+                # is an EOS must not ship the second.
+                finished = False
+                _ft801_appended = 0
+                # ⭐ ONE call per request per drain, off integers this drain already holds.
+                # ⛔⛆ #801 r6 b9bn: the FIRST argument is `_ft801_own[i]`, the drained forward's
+                # OWN post-commit `cached_len` -- NEVER `req.cached_len`, which by now carries the
+                # next forward's commit. See the hoist above.
+                _ft801_lengths = (
+                    None
+                    if _ft801_lengths_of is None
+                    or _ft801_own is None
+                    or i >= len(_ft801_own)
+                    else _ft801_lengths_of(
+                        int(_ft801_own[i]),
+                        int(_ft801_published[i].numel()),
+                        int(req.max_device_len),
                     )
                 )
+                for _ft801_token in _ft801_published[i]:
+                    req.append_host(_ft801_token.unsqueeze(0))
+                    _ft801_appended += 1
+                    next_token = int(_ft801_token.item())
+                    # EOS / stop-string -> "stop", output budget exhausted -> "length";
+                    # EOS and stop strings win over length.
+                    hit_length = (
+                        (not req.can_decode)
+                        if _ft801_lengths is None
+                        else bool(_ft801_lengths[_ft801_appended - 1])
+                    )
+                    hit_eos = (
+                        not req.sampling_params.ignore_eos and next_token in self.eos_token_ids
+                    )
+                    matched_stop = (
+                        self._match_stop_str(req)
+                        if not hit_eos and req.sampling_params.stop_strs
+                        else None
+                    )
+                    finished = hit_length or hit_eos or matched_stop is not None
+                    finish_reason = (
+                        ("stop" if (hit_eos or matched_stop is not None) else "length")
+                        if finished
+                        else None
+                    )
+                    if (
+                        next_token == self.toolcall_anchor_id
+                        and req.toolcall_anchor_len is None
+                        and not finished
+                    ):
+                        req.toolcall_anchor_len = req.input_ids.numel()
+                    reply.append(
+                        DetokenizeMsg(
+                            uid=req.uid,
+                            next_token=next_token,
+                            finished=finished,
+                            finish_reason=finish_reason,
+                            matched_stop=matched_stop,
+                            stop_strs=req.sampling_params.stop_strs or None,
+                        )
+                    )
+                    if finished:
+                        break
+                # ⛔⛆ #801 bullet 9az: EVERY COMMITTED TOKEN OWES `append_host` AN ID, INCLUDING
+                # the ones the loop above broke before -- and the break above is REACHABLE ON A
+                # PAIR'S FIRST TOKEN. `hit_length` is `not req.can_decode`, i.e.
+                # `device_len >= max_device_len`, and `spec.commit_verify` advanced `device_len`
+                # by the WHOLE accepted pair before this drain ran, so a pair landing on the
+                # output cap trips *length* on token 1 and token 2 was never appended.
+                # ⛔⛆ THAT IS A PAGE LEAK, NOT A COSMETIC SHORT REPLY. `_cache_req_hybrid`'s
+                # finish-donate keys the tree on `_cache_ids(req)` -- and
+                # `kvcache/hybrid_radix_cache.py:96` IGNORES the length the caller sliced to:
+                # `insert_len = align_down(len(input_ids), page_size)`. 127 ids against 128 page
+                # indices seats `align_down(127, 64) = 64`, returns `prefix_len = 64`, and BOTH
+                # the dedup free (`page_indices[64:max(64,64)]`) and `_padded_tail` (`[128:128]`)
+                # are EMPTY. The tail page is charged, in the row, and owned by nobody:
+                # `free_pages(4094) + cache_pages(1) != num_pages(4096)` -- load 20's signature,
+                # reproduced at the desk by `repro_page_ledger_801.py` (prompt 65, max_new 64,
+                # alt-RA: free(14) + cache(1) != 16 on the 16-page pool).
+                # ⭐ INVARIANT: `req.input_ids.numel() == req.cached_len` at retire.
+                # ⭐ A NON-SPECULATING ROW IS UNCHANGED BYTE FOR BYTE -- it commits one token per
+                # forward, so the loop above never breaks early and this slice is always empty.
+                # ⚠ 9az left `hit_length` alone deliberately, so this loop ALSO carried the
+                # client's short reply. #801 r6 b9bh fixed the verdict above, so on a *length*
+                # finish this slice is now empty -- the pair's second token ships. It still
+                # fires on an EOS or a stop string landing on a pair's FIRST token, which is
+                # the case that must NOT ship the second, and the ids are still owed.
+                _ft801_tail = 0
+                for _ft801_token in _ft801_published[i][_ft801_appended:]:
+                    req.append_host(_ft801_token.unsqueeze(0))
+                    _ft801_tail += 1
+                # ── #801 r6 b9bd: what this block APPENDED, counted where it appends ─────
+                # ⛔⛆ Both loops, and counted rather than re-derived from
+                # `ids_after - ids_before`: a derivation agrees with itself even when a future
+                # edit appends somewhere else in this block, which is exactly the miss 9bb's own
+                # gate caught in `cache.py` on its first run. A no-op when the dial is off.
+                if _ft801_pub is not None:
+                    _ft801_pub[i]["appended"] = _ft801_appended
+                    _ft801_pub[i]["tail"] = _ft801_tail
 
                 # NOTE: overlap scheduling may make the request freed twice, skip second free
                 if finished and req not in self.finished_reqs:
@@ -424,6 +613,50 @@ class Scheduler(SchedulerIOMixin):
                     # None'd GDN ping-pong slots).
                     self.cache_manager.cache_req(req, finished=False)
 
+        # ── #801 r6 b9bd: emit the publish ledger ───────────────────────────────────────
+        # ⛔ HERE, not inside the loop: `skip` has to be read with `self.finished_reqs` still
+        #   holding what the loop itself tested, and a request the loop `continue`d never
+        #   reaches an in-loop emit -- which is the whole point, since a skipped request is a
+        #   forward whose committed tokens were dropped in silence.
+        # ⚠ `ids_after` / `cached_len_after` are read here rather than per request: nothing in
+        #   this drain touches another request's `input_ids`, and the retire (`_free_req_resources`
+        #   -> `_cache_req_hybrid`, 9bb's ledger) has already run by now, so the two instruments
+        #   describe the SAME moment and can be read against each other.
+        if _ft801_pub is not None:
+            import json as _ft801_json
+
+            for _ft801_i, _ft801_req in enumerate(batch.reqs):
+                _ft801_rec = _ft801_pub[_ft801_i]
+                _ft801_rec["skip"] = (
+                    "chunked"
+                    if isinstance(_ft801_req, ChunkedReq)
+                    else "aborted"
+                    if _ft801_req.aborted
+                    else "already_finished"
+                    if _ft801_req in self.finished_reqs
+                    else None
+                )
+                _ft801_rec["ids_after"] = int(_ft801_req.input_ids.numel())
+                _ft801_rec["cached_len_after"] = int(_ft801_req.cached_len)
+                # ⭐ The number this whole instrument exists to print, greppable in a 14-minute
+                #   log: what the commit advanced by, minus what reached the host ids.
+                _ft801_rec["deficit"] = _ft801_rec["committed"] - (
+                    _ft801_rec["appended"] + _ft801_rec["tail"]
+                )
+            print(
+                "[#801] pubcheck: "
+                + _ft801_json.dumps(
+                    {
+                        "left": int(self._ft801_pubcheck_left),
+                        "staged": getattr(batch, "ft801_verify_step", None) is not None,
+                        "is_prefill": bool(batch.is_prefill),
+                        "rows": list(next_tokens_cpu.shape),
+                        "reqs": _ft801_pub,
+                    }
+                ),
+                file=_ft801_sys.stderr,
+                flush=True,
+            )
         self.finished_reqs = new_finished_reqs
         # Stamp each reply with the post-batch KV page occupancy so the frontend (shell
         # status bar) can show live KV usage without a separate query.
@@ -451,6 +684,16 @@ class Scheduler(SchedulerIOMixin):
             page_size=self.config.page_size,
             mamba_slots=mamba_slots,
             swa_tokens=swa_tokens,
+            # ── #801 round 7: what this forward COMMITTED, so the log line is tokens/s ───
+            # ⭐ MODEL-AGNOSTIC, like every other #801 hook in this file: on an unstaged batch
+            #   -- every prefill, every flag-off row, every no-draft decode step --
+            #   `_ft801_published_tokens` returns one one-element tensor per request, so this
+            #   sum IS `len(batch.reqs)` and the reporter logs exactly what the image logs.
+            # ⚠ Counts every row of the forward, including one the loop below then skips as
+            #   aborted or already-finished. That is the IMAGE's own treatment (`len(batch.reqs)`
+            #   counts those rows too), kept deliberately so the only thing this edit changes is
+            #   steps -> tokens.
+            generated_tokens=sum(int(_ft801_p.numel()) for _ft801_p in _ft801_published),
         )
         self.send_result(reply)
 
@@ -1058,6 +1301,20 @@ class Scheduler(SchedulerIOMixin):
             logger.warning(f"could not log cache geometry: {e!r}")
 
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
+        # ── #801 bullet 8: stage the verify step ─────────────────────────────────────────
+        # ⛔⛆ FIRST, before `pad_batch`. The staging advances each request's `device_len` to
+        # `cached_len + T`, and EVERY consumer downstream derives the verify shape from that one
+        # field: `_make_positions` and `_make_input_tuple` here, `attention/linear.py::
+        # build_fla_metadata`, `attention/qsa_sparse.py`, and `engine/graph.py::_uniform_width`
+        # -- which `pad_batch` itself asks, through `can_use_cuda_graph`. Staged after it, a
+        # verify batch would be routed as a T=1 step and REPLAY THE T=1 GRAPH, which admits it
+        # and does not error.
+        # ⛔ MODEL-AGNOSTIC, like every other #801 hook in an engine file: a model without
+        # `mtp_stage_verify` gets this method exactly as the image ships it, and so does a model
+        # whose verify dial is off -- the hook answers `None` and touches nothing.
+        _ft801_stage = getattr(self.engine.model, "mtp_stage_verify", None)
+        if _ft801_stage is not None:
+            _ft801_stage(batch, self.token_pool)
         self.engine.graph_runner.pad_batch(batch)
         self._forward_iter += 1
         if batch.is_decode:
@@ -1200,7 +1457,46 @@ def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:
     return mapping_host.to(device, non_blocking=True), batch.positions.to(torch.int64)
 
 
+def _ft801_published_tokens(batch: Batch, next_tokens_cpu: torch.Tensor) -> list:
+    """#801 bullet 8: per request, the tokens this drained forward actually committed.
+
+    ⛔ MODEL-AGNOSTIC: it reads the step the model staged on the batch, the same carrier
+    `models/qwen4_exp/gdn.py` uses for `batch.linear_snapshots`. An unstaged batch -- every
+    prefill, every flag-off row, every no-draft decode step -- is one token per request, which is
+    what the image does and what it costs.
+    """
+    staged = getattr(batch, "ft801_verify_step", None)
+    if staged is None:
+        return [next_tokens_cpu[i : i + 1] for i in range(len(batch.reqs))]
+    from freetoken.models.qwen4_exp.spec import published_tokens
+
+    return published_tokens(batch, next_tokens_cpu)
+
+
 def _make_write_tuple(batch: Batch, device: torch.device) -> Indice2D:
+    # ── #801 bullet 8: one row per TOKEN when a verify step is staged ────────────────────
+    # ⛔⛆ The one builder that does NOT generalise for free. `_make_positions` and
+    # `_make_input_tuple` are written in terms of `Req.extend_len` and produce the verify step's
+    # layout unmodified; this one emits one row per REQUEST at `device_len`, which on a T=2 step
+    # is one past the BONUS row's input. Kept as-is, a verify step writes the verify row's token
+    # over the bonus slot and drops the bonus entirely -- and at bs == 1 the scatter BROADCASTS
+    # rather than raising, so the row serves, slightly wrong, in silence.
+    _ft801_staged = getattr(batch, "ft801_verify_step", None)
+    if _ft801_staged is not None:
+        _ft801_plan = _ft801_staged.plan
+        _ft801_rows = [batch.reqs[r] for r in _ft801_plan.token_to_req]
+        mapping_host = torch.tensor(
+            [req.table_idx for req in _ft801_rows], dtype=torch.int64, pin_memory=True
+        )
+        write_host = torch.tensor(
+            [
+                (position if req.can_decode else -1)
+                for req, position in zip(_ft801_rows, _ft801_plan.write_positions)
+            ],
+            dtype=torch.int64,
+            pin_memory=True,
+        )
+        return mapping_host.to(device, non_blocking=True), write_host.to(device, non_blocking=True)
     mapping_list = [req.table_idx for req in batch.reqs]
     mapping_host = torch.tensor(mapping_list, dtype=torch.int64, pin_memory=True)
     write_list = [(req.device_len if req.can_decode else -1) for req in batch.reqs]

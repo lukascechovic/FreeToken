@@ -29,6 +29,35 @@ rows, the block's slab page. Decode stages that table plus the live lengths and 
 static buffers (``prepare_for_replay``) so the whole path is CUDA-graph capturable.
 """
 
+# ── #801 overlay marker ──────────────────────────────────────────────────────────────────────
+# This file is `attention/qsa_sparse.py` from image
+# `llm-server/freetoken-gfx1201:2026-09-09-agree-0022` (md5 71c68ce977081fb55528f60b065c0375,
+# 507 lines) BIND-MOUNTED over the installed package, plus this block and the four #801-marked
+# edits below. ⛔ It is NOT a patch in the Dockerfile ladder and NOT in any image, so it must be
+# in `arm_mtp_801.sh`'s OVERLAY manifest (and its ORIGS list) or the row runs the image's copy
+# with nothing erroring (#866).
+#
+# ⛔⛆ WHY IT EXISTS. This backend DEFERS decode addressing and then rebuilds it as
+#   ``token_to_req = arange(bs)`` / ``cu_seqlens = arange(bs + 1)`` -- one query row per request,
+#   hard-coded. #801's verify step forwards TWO rows for a speculating request, and every QSA
+#   kernel (`kernel/triton/qsa/{compress,score,expand,attend}.py`) indexes its per-request
+#   tensors THROUGH that map. At bs >= 2 the stale map is a length mismatch and torch raises; at
+#   bs == 1 every stale tensor has length 1 and broadcasts CLEANLY against the two-token ones, so
+#   the step completes with the wrong ring mask and nothing anywhere errors -- and bs == 1 is the
+#   single-stream shape this round measures. Gated in `test_qsa_metadata_801.py`
+#   (`./check_qsa_801.sh`), against this file's own `.orig` rather than a re-derivation.
+#
+# ⚠ NO MARKER PRINT, and no behaviour change on the one-token step: `prepare_metadata` builds the
+#   ragged host map ONLY when some request forwards more than one token, and `_snapshot_decode`
+#   still takes the two aranges otherwise. The differential gate is what asserts the mount took.
+#
+# ⭐ ROUND 6 BULLET 6 WIDENED THE CAPTURED PATH. The per-TOKEN buffers are `[max_bs * width]` and
+#   `_stage_decode` stages a uniform T-token step instead of refusing it; the per-REQUEST ones
+#   (`block_table`, `kvlen`, `table_idx`) stay `[max_bs]` because every kernel reaches them
+#   THROUGH `token_to_req`. ⛔ The refusal did not go away, it MOVED: `_stage_width` still fails
+#   loudly on a ragged step or a width that was not captured, because `_stage_decode` is reached
+#   through `prepare_for_replay` as well as through the router.
+
 from __future__ import annotations
 
 import os
@@ -69,6 +98,19 @@ def _resolve_block_topk() -> Callable | None:
     return qsa_block_topk
 
 
+def _token_to_req(bs: int, seqlens_q: List[int]) -> torch.Tensor:
+    """``[T] int32`` query row -> request, pinned: the ragged map every QSA kernel indexes by.
+
+    #801 bullet 4: lifted out of `prepare_metadata`'s prefill branch, which is where it was
+    already written, because a verify DECODE step needs the same map -- ``arange(bs)`` is only
+    its one-token special case.
+    """
+    return torch.repeat_interleave(
+        torch.arange(bs, dtype=torch.int32),
+        torch.tensor(seqlens_q, dtype=torch.int32),
+    ).pin_memory()
+
+
 @dataclass
 class QSASparseMetadata(BaseAttnMetadata):
     # fmt: off
@@ -76,9 +118,15 @@ class QSASparseMetadata(BaseAttnMetadata):
     last_indices:     torch.Tensor  # gpu
     qo_indptr_cpu:    torch.Tensor  # cpu pinned int32 [bs+1]
     kv_len_cpu:       torch.Tensor  # cpu pinned int32 [bs]
+    # #801: T, this forward's query rows. Equals bs on a one-token decode step; a verify step
+    # forwards two rows for every speculating request, and that is the whole difference.
+    num_tokens:       int
     # Ragged per-token / per-request addressing. Decode defers these to the static graph
     # buffers (prepare_for_replay) or to a lazy eager snapshot at the first QSA layer.
     token_to_req:     torch.Tensor | None = None  # [T] int32
+    # #801: the host side of the above, built only when T != bs. `is None` IS the decode fast
+    # path's discriminator -- see `_snapshot_decode`.
+    token_to_req_cpu: torch.Tensor | None = None  # cpu pinned int32 [T]
     cu_seqlens:       torch.Tensor | None = None  # [bs+1] int32
     seq_lens:         torch.Tensor | None = None  # [bs] int32, device_len
     ring_slots:       torch.Tensor | None = None  # [bs] int32, Req.table_idx
@@ -189,19 +237,23 @@ class QSASparseAttnBackend(BaseAttnBackend):
             last_indices=last,
             qo_indptr_cpu=qo_indptr,
             kv_len_cpu=kv_len,
+            num_tokens=sum(seqlens_q),  # #801
         )
         batch.attn_metadata = md
         if not is_decode:
             table_idx = torch.tensor([r.table_idx for r in reqs], **_CPU_PINNED)
-            token_to_req = torch.repeat_interleave(
-                torch.arange(len(reqs), dtype=torch.int32),
-                torch.tensor(seqlens_q, dtype=torch.int32),
-            ).pin_memory()
+            token_to_req = _token_to_req(len(reqs), seqlens_q)  # #801: was inline here
             md.cu_seqlens = qo_indptr.to(self.device, non_blocking=True)
             md.token_to_req = token_to_req.to(self.device, non_blocking=True)
             md.seq_lens = kv_len.to(self.device, non_blocking=True)
             md.ring_slots = table_idx.to(self.device, non_blocking=True)
             md.block_table = self._block_table(md.ring_slots.to(torch.int64))
+        elif md.num_tokens != len(reqs):
+            # #801: a DECODE step forwarding more than one token for some request -- the verify
+            # step. The deferred one-token path below reads `arange(bs)`, which is not this
+            # step's map; build the ragged one here, on the host, where the query lengths
+            # already exist. Guarded on the count so the every-served-row step pays nothing.
+            md.token_to_req_cpu = _token_to_req(len(reqs), seqlens_q)
         # Decode addressing is DEFERRED: a graph-bound step stages it into the static
         # buffers (prepare_for_replay), an eager step snapshots at the first QSA layer.
 
@@ -217,7 +269,18 @@ class QSASparseAttnBackend(BaseAttnBackend):
 
     def _stage_decode(self, md: QSASparseMetadata, bs: int, table_idx: torch.Tensor) -> None:
         """Copy this step's addressing into the static graph buffers and point the metadata
-        at them (restage-per-replay, m3/dsa precedent)."""
+        at them (restage-per-replay, m3/dsa precedent).
+
+        ``table_idx`` is one page-table row per REQUEST, or this step's per-ROW tensor
+        (`Batch.active_table_idx`) to take them from -- see `_request_rows`.
+
+        ⭐ #801 round 6 bullet 6: the token->request map and the query indptr are CONSTANT for a
+        given width (uniform T ⇒ ``arange(rows) // T`` and ``arange(bs + 1) * T``), so both
+        widths are filled once in `init_capture_graph` and neither is ever copied here. The
+        per-REQUEST buffers below are the only per-step writes, exactly as before.
+        """
+        width = self._stage_width(md, bs)
+        table_idx = self._request_rows(table_idx, bs, width)
         self._graph["block_table"][:bs].copy_(
             self._block_base_view().index_select(0, table_idx) // self.page_size
         )
@@ -226,8 +289,65 @@ class QSASparseAttnBackend(BaseAttnBackend):
         md.block_table = self._graph["block_table"][:bs]
         md.seq_lens = self._graph["kvlen"][:bs]
         md.ring_slots = self._graph["table_idx"][:bs]
-        md.token_to_req = self._graph["token_to_req"][:bs]
-        md.cu_seqlens = self._graph["cu_seqlens"][: bs + 1]
+        if width == 1:
+            md.token_to_req = self._graph["token_to_req"][:bs]
+            md.cu_seqlens = self._graph["cu_seqlens"][: bs + 1]
+        else:
+            md.token_to_req = self._graph["token_to_req_verify"][: bs * width]
+            md.cu_seqlens = self._graph["cu_seqlens_verify"][: bs + 1]
+
+    def _request_rows(self, table_idx: torch.Tensor, bs: int, width: int) -> torch.Tensor:
+        """One page-table row per REQUEST, from a tensor that may carry one per ROW.
+
+        ⛔⛆ #801 round 6 bullet 9d -- THE FIRST LOAD'S OWN FINDING, and the one thing no desk
+        gate could have caught, because none of them called `prepare_for_replay`. The captured
+        verify replay reaches here through `prepare_for_replay`, which passes
+        `Batch.active_table_idx`; `scheduler._make_input_tuple` fills that with ``req.table_idx``
+        once per TOKEN (``extend_len`` copies each). At width 1 rows and requests are the same
+        count -- every row this box has ever served -- so the mismatch first exists on a verify
+        step, where it died in the `copy_` below with *"output with shape [1, 4096] doesn't match
+        the broadcast shape [2, 4096]"*: one request, two rows.
+
+        ⭐ `init_capture_graph` states the rule being violated IN ITS OWN COMMENT -- block_table /
+        kvlen / table_idx are per REQUEST and must NOT grow with the width, because every QSA
+        kernel reaches them THROUGH `token_to_req`. Bullet 6 wrote it for the buffers and did not
+        apply it to the one argument that crosses the boundary into them.
+
+        ⭐ A request's rows all carry ITS table_idx, so column 0 IS ``[r.table_idx for r in
+        padded_reqs]`` -- the spelling the eager path (`_snapshot_decode`, right all along) builds
+        on the host. ⛔ At width 1 the tensor is returned UNTOUCHED, not rebuilt: the served decode
+        step must not pay one extra op for a path it never takes.
+        """
+        if table_idx.numel() == bs:
+            return table_idx
+        assert table_idx.numel() == bs * width, (
+            f"qsa_sparse: staging {bs} requests at width {width} wants {bs} or {bs * width} "
+            f"page-table rows, not {table_idx.numel()} (#801 r6 b9d)."
+        )
+        return table_idx.view(bs, width)[:, 0]
+
+    def _stage_width(self, md: QSASparseMetadata, bs: int) -> int:
+        """#801: rows per request this step stages, checked against what was CAPTURED.
+
+        ⛔ A captured graph bakes its row count and its indptr, so only a UNIFORM step whose width
+        is the captured one can be staged. `engine/graph.py::GraphRunner.can_use_cuda_graph`
+        already refuses everything else -- this is the second lock, because `_stage_decode` is
+        also reached through `prepare_for_replay`, and bullet 4 put an assertion here precisely
+        because the alternative is a replay of the wrong graph that reads as a working row.
+        """
+        if md.token_to_req_cpu is None:
+            return 1
+        width = int(getattr(self, "verify_width", 1) or 1)
+        assert width > 1 and md.num_tokens == bs * width, (
+            f"qsa_sparse: this decode step forwards {md.num_tokens} tokens for {bs} requests, "
+            f"and the static graph buffers were built for width {width}. Only a uniform "
+            "step of the captured width can replay; anything else must run eager (#801 r6 b6)."
+        )
+        assert md.qo_indptr_cpu.tolist() == [i * width for i in range(bs + 1)], (
+            f"qsa_sparse: this decode step is ragged ({md.qo_indptr_cpu.tolist()}) and a captured "
+            "graph bakes one indptr. A ragged verify batch must run eager (#801 r6 b6)."
+        )
+        return width
 
     def _snapshot_decode(self, md: QSASparseMetadata, batch: Batch) -> None:
         """Eager decode (not graph-staged): this step's rows, once per forward. The live
@@ -238,8 +358,79 @@ class QSASparseAttnBackend(BaseAttnBackend):
         md.ring_slots = table_idx.to(self.device, non_blocking=True)
         md.block_table = self._block_table(md.ring_slots.to(torch.int64))
         md.seq_lens = md.kv_len_cpu.to(self.device, non_blocking=True)
-        md.token_to_req = torch.arange(bs, dtype=torch.int32, device=self.device)
-        md.cu_seqlens = torch.arange(bs + 1, dtype=torch.int32, device=self.device)
+        # #801: the one-token step -- every served row today -- keeps the two aranges verbatim.
+        # A verify step took the ragged branch in `prepare_metadata` and moves that map instead;
+        # its `cu_seqlens` is `qo_indptr`, which for T == 1 IS `arange(bs + 1)`.
+        if md.token_to_req_cpu is None:
+            md.token_to_req = torch.arange(bs, dtype=torch.int32, device=self.device)
+            md.cu_seqlens = torch.arange(bs + 1, dtype=torch.int32, device=self.device)
+        else:
+            md.token_to_req = md.token_to_req_cpu.to(self.device, non_blocking=True)
+            md.cu_seqlens = md.qo_indptr_cpu.to(self.device, non_blocking=True)
+
+    def draft_metadata(
+        self, md: QSASparseMetadata, kv_lens: List[int]
+    ) -> QSASparseMetadata:
+        """A T=1 metadata for the MTP head's own forward: ONE query row per request.
+
+        ⛔⛆ **#801 round 6 bullet 9e, and load 4 died on it.** `spec.shadow_step` forwards the head
+        over one row per REQUEST (bullet 8c's `draft_rows`) while handing it the BACKBONE's batch.
+        On a verify step that batch is one row per TOKEN, and the head's KV store raised
+        ``store.cu:88, Size mismatch for L(shape#0): expected 1 but got 2``. ⛔ The store is only
+        where it surfaced: `qsa_forward` reaches `token_to_req`, `cu_seqlens`, `seq_lens` and the
+        scatter plan through this object, and every one of them is the backbone's width.
+
+        ⭐ **Per-REQUEST fields are the backbone's own, taken not rebuilt.** `block_table` and
+        `ring_slots` already carry one row per request (`init_capture_graph` says so in its own
+        comment, and bullet 9d's crash came from breaking that rule) and the head only READS them.
+        Rebuilding them would re-gather a page table the next batch's `allocate_paged` may already
+        have moved -- the exact staleness `_snapshot_decode` exists to avoid.
+
+        ⭐ **The scatter plan is deliberately left None.** `qsa_forward` rebuilds it when
+        ``slot == 0 or md.cmp_rows is None``; the head is a single layer and need not be slot 0, so
+        a carried plan would compress the head's K/V into the slab row of a token it never
+        forwarded.
+
+        ⛔⛆ **``kv_lens`` IS THE α TAX, and the caller owes it one length per REQUEST.** The
+        backbone ran at ``device_len``; on a REJECTED step only ``cached_len + 1`` of that is real,
+        **and the head's own KV layer was never written at the rejected slot** -- it writes one row
+        per step, at the position it drafts from. `seq_lens` feeds `qsa_mqa_paged`'s visible-block
+        count and `expand_qsa_block_indices`, so an inflated length lets a slot holding whatever
+        the pool last left there compete for the head's top-k budget. Nothing raises; α reads low.
+        `spec.draft_view` passes ``plan.positions[draft_row] + 1``, which is `device_len` exactly
+        on a plain step and one short of it on a rejected one.
+
+        ⛔ A NEW length tensor, never an edit in place: `_stage_decode` points `md.seq_lens` at the
+        shared ``self._graph["kvlen"]`` buffer, and correcting that would be right for this step
+        and wrong for the next replay.
+        """
+        bs = len(kv_lens)
+        assert md.ring_slots is not None and md.block_table is not None, (
+            "qsa_sparse: the head drafts AFTER the backbone's forward, which binds the "
+            "per-request tensors (#801 r6 b9e)"
+        )
+        assert md.ring_slots.shape[0] >= bs, (
+            f"qsa_sparse: one kv length per request, got {bs} for a step with "
+            f"{md.ring_slots.shape[0]} request(s) (#801 r6 b9e)."
+        )
+        # The spelling `prepare_metadata` uses for the same two host buffers, at width 1.
+        qo_indptr = torch.tensor([0] + [1] * bs, **_CPU_PINNED).cumsum_(0).to(torch.int32)
+        kv_len = torch.tensor(list(kv_lens), **_CPU_PINNED)
+        draft = QSASparseMetadata(
+            is_decode=True,
+            last_indices=(qo_indptr[1:].to(torch.int32) - 1).to(self.device, non_blocking=True),
+            qo_indptr_cpu=qo_indptr,
+            kv_len_cpu=kv_len,
+            num_tokens=bs,
+        )
+        # ⭐ `token_to_req_cpu` stays None: T == bs IS the one-token fast path's own discriminator
+        #   (`_snapshot_decode`'s comment), and these two aranges are what it would have built.
+        draft.token_to_req = torch.arange(bs, dtype=torch.int32, device=self.device)
+        draft.cu_seqlens = qo_indptr.to(self.device, non_blocking=True)
+        draft.seq_lens = kv_len.to(self.device, non_blocking=True)
+        draft.ring_slots = md.ring_slots[:bs]
+        draft.block_table = md.block_table[:bs]
+        return draft
 
     # ----- dense layers -------------------------------------------------------------------
     def forward(
@@ -457,10 +648,20 @@ class QSASparseAttnBackend(BaseAttnBackend):
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
         self.capture_bs = sorted(bs_list)
         max_bs = max(bs_list)
-        width = get_global_ctx().page_table.shape[1]
-        pages = -(-width // self.page_size)
+        table_width = get_global_ctx().page_table.shape[1]
+        pages = -(-table_width // self.page_size)
         columns = pages * self.cmp_page_size
-        chunk = max(1, min(max_bs, _LOGITS_WORKSPACE_BYTES // max(columns * 4, 1)))
+        # ⭐ #801 round 6 bullet 6: rows per request a CAPTURED step may forward. `engine/graph.py`
+        #   sets it before this call (duck-typed, so no other backend needs to know what a verify
+        #   step is); 1 -- the default -- builds exactly the buffers this file always built.
+        verify = int(getattr(self, "verify_width", 1) or 1)
+        # ⛔ THE SPLIT THAT MATTERS. `block_table` / `kvlen` / `table_idx` are per REQUEST and must
+        #   NOT grow with the width: every QSA kernel reaches them THROUGH `token_to_req`, so a
+        #   widened one would double-count each request. Everything else here is per TOKEN, and a
+        #   step wider than its static buffer makes `_scratch` fall back to a fresh allocation --
+        #   correct, and uncapturable, which is the whole failure this bullet exists to remove.
+        rows = max_bs * verify
+        chunk = max(1, min(rows, _LOGITS_WORKSPACE_BYTES // max(columns * 4, 1)))
         topk_scratch = self._topk_scratch_width(columns)
 
         def empty(*shape: int, dtype: torch.dtype) -> torch.Tensor:
@@ -473,13 +674,23 @@ class QSASparseAttnBackend(BaseAttnBackend):
             "token_to_req": torch.arange(max_bs, dtype=torch.int32, device=self.device),
             "cu_seqlens": torch.arange(max_bs + 1, dtype=torch.int32, device=self.device),
             "logits": empty(chunk, columns, dtype=torch.float32),
-            "visible": empty(max_bs, dtype=torch.int32),
-            "blocks": empty(max_bs, self.block_topk, dtype=torch.int32),
-            "indices": empty(max_bs, self.select_width, dtype=torch.int32),
-            "pooled": empty(max_bs, self.index_head_dim, dtype=self.dtype),
-            "first_pos": empty(max_bs, dtype=torch.int32),
-            "q_index": empty(max_bs, self.index_heads, self.index_head_dim, dtype=self.dtype),
+            "visible": empty(rows, dtype=torch.int32),
+            "blocks": empty(rows, self.block_topk, dtype=torch.int32),
+            "indices": empty(rows, self.select_width, dtype=torch.int32),
+            "pooled": empty(rows, self.index_head_dim, dtype=self.dtype),
+            "first_pos": empty(rows, dtype=torch.int32),
+            "q_index": empty(rows, self.index_heads, self.index_head_dim, dtype=self.dtype),
         }
+        if verify > 1:
+            # Constant per width, filled once: a uniform T-token step's token->request map is
+            # `arange(rows) // T` and its query indptr is `arange(bs + 1) * T`. Neither depends
+            # on the step, so `_stage_decode` copies neither.
+            self._graph["token_to_req_verify"] = (
+                torch.arange(rows, dtype=torch.int32, device=self.device) // verify
+            )
+            self._graph["cu_seqlens_verify"] = (
+                torch.arange(max_bs + 1, dtype=torch.int32, device=self.device) * verify
+            )
         if topk_scratch:
             self._graph["topk_scratch"] = empty(chunk, topk_scratch, dtype=torch.int32)
 
@@ -497,6 +708,10 @@ class QSASparseAttnBackend(BaseAttnBackend):
         md = batch.attn_metadata
         assert isinstance(md, QSASparseMetadata)
         assert batch.active_table_idx is not None, "decode batch is missing its page-table rows"
+        # ⛔ #801 r6 b9d: this tensor is per ROW (`scheduler._make_input_tuple`), and every buffer
+        #   `_stage_decode` writes is per REQUEST. `_request_rows` takes the one per request --
+        #   AFTER `_stage_width`, so a ragged step still gets its own "must run eager" verdict
+        #   rather than a reshape error naming neither.
         self._stage_decode(md, batch.padded_size, batch.active_table_idx.to(torch.int64))
 
     def reset_capture(self) -> None:

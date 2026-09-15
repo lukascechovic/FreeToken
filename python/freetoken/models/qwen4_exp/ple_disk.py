@@ -1,3 +1,65 @@
+# ── #801 overlay marker ──────────────────────────────────────────────────────────────────────
+# This file is `models/qwen4_exp/ple_disk.py` from image
+# `llm-server/freetoken-gfx1201:2026-09-09-agree-0022` (md5 82839118e9b58e6cb56faea541ba781c,
+# 272 lines) BIND-MOUNTED over the installed package, plus this block, `_decode_runs`,
+# `_undrained_context` and the `.spec` import it needs, the two lines of `host_fill_batch` that
+# call it, the readback width, and one assertion in `fill`.
+# ⛔ In no image, in no Dockerfile ladder: `arm_mtp_801.sh`'s OVERLAY and ORIGS lists or
+# nothing (#866).
+#
+# ⛔⛆ WHY IT EXISTS, AND WHY IT IS BULLET 9C AND NOT BULLET 8B. This is PLE's OTHER half. Bullet
+#   8b fixed `ple.py` -- the compute half, the conv and the n-gram context -- and reasoned
+#   carefully about capture; it never opened this file, because nothing named it. `--ple-backend
+#   disk` is what the DEPLOYED ROW and `arm_mtp_801.sh` both run, so the whole of bullet 8b's
+#   work reaches the box through here. The round's second load found it ~90 s in, and it is the
+#   sixth silent site by count and bullet 8b's own rule turned back on bullet 8b: **a hazard
+#   carried forward by name is a claim until someone opens the file** -- nobody had opened this
+#   one, because no name pointed at it.
+#
+# ⛔⛆ THE TWO BUGS, AND THEY ARE BULLET 8C'S EXACT SHAPE. One line of the decode branch, written
+#   twice (once in the flag-sync path, once in launch-gating):
+#
+#       runs = [torch.tensor([*_context(r.input_ids, r.device_len - 1, eos), t], ...)
+#               for r, t in zip(reqs, tokens)]
+#
+#   ⛔⛆ AND BUG 2 HAS A CROSS-STEP HALF THAT BULLET 9C DID NOT SEE — #801 bullet 9j. Moving the
+#   context back by `extend_len` fixed the read WITHIN a verify step. It does not help the step
+#   AFTER one: `commit_verify` advances `cached_len` by TWO on an acceptance while the drain is a
+#   whole iteration behind, so the next fill asks for an id `req.input_ids` does not hold yet and
+#   load 5 died on exactly that, ~63 steps in. `_undrained_context` + `spec.host_token_id` close
+#   it, and the id they need is host-known because it is the accepted DRAFT.
+#
+#   1. `tokens` is the per-ROW device readback and `reqs` is per REQUEST, so `zip` TRUNCATES.
+#      At bs=1 T=2 it would take the committed token's row and drop the draft's entirely -- the
+#      forward then hashes one window where it has two token rows, and `lookup` copies the second
+#      row out of whatever the pinned staging happened to hold.
+#   2. `r.device_len - 1` is the position the NEW token sits at only when the step forwards ONE
+#      token. On a verify step `device_len == cached_len + 2`, so it reads `input_ids[cached_len]`
+#      -- one PAST the last host-known id, because the host ids only catch up at the drain
+#      (`scheduler.overlap_loop` runs `_forward` before `_process_last_data`). That raises
+#      `IndexError: index 66 is out of bounds for dimension 0 with size 66`, which is how the bug
+#      announced itself rather than serving quietly.
+#
+# ⭐ THE FIX IS THE SHAPE `fill` ALREADY WANTED. `fill` stages `run.numel() - 2` hash rows per run
+#   -- a run is `[ctx0, ctx1, tok...]` and the C++ store slides the window itself -- and the
+#   PREFILL branch in this same file already hands it exactly that: a context taken at
+#   `req.cached_len` followed by EVERY new token. So a verify step wants ONE run per REQUEST
+#   carrying BOTH tokens, not one run per token, with the context taken `n` positions back.
+#   ⭐⭐ At `n == 1` that is byte-identically today's arithmetic, which is the check that the
+#   plain decode path -- every row this box serves -- is untouched;
+#   `test_ple_verify_801.py::TestAPlainDecodeStepDidNotMove` proves it as a DIFFERENTIAL against
+#   `ple_disk.py.orig` rather than asserting it.
+#
+# ⭐ THE BUFFERS ARE NOT WIDENED, DELIBERATELY. `max_graph_rows` is
+#   `max(256, cuda_graph_max_bs or 0)` (`model.py`) against the EIGHT rows a bs=4 T=2 step needs,
+#   so `_graph_pinned`, `_graph_dev` and `_token_readback` all already hold a verify step. ⛔ The
+#   `fill` assertion below is the LOCK on that reasoning, not a second copy of it: it cannot fire
+#   while `mtp_verify_graph_max_bs` stays at 4, and it fires loudly instead of writing past a
+#   pinned allocation if a later change raises either dial.
+#
+# ⛔ `device_len` is READ here and never written: the staging that advanced it is
+#   `spec.stage_verify`, and `Req.extend_len` is a read-only property over the two fields.
+
 """Disk-backed PLE table (--ple-backend disk): the C++ store hashes n-gram windows and batch-reads rows from the checkpoint's fp8 shard tensors into pinned staging; the captured ``lookup`` is a fixed-shape H2D copy + dequant.
 
 Hash windows are pure functions of ``req.input_ids`` + ``device_len`` (prefix hits, restores and COW forks need no bookkeeping); the decode input token lives device-side under overlap scheduling and is read back here.
@@ -17,6 +79,7 @@ from freetoken.core import Batch
 from freetoken.kernel.pinned import alloc_pinned_tensor
 from freetoken.utils import init_logger
 
+from .spec import UNDRAINED_IDS, host_token_id
 from .weight import (
     _PLE_SCALE_SUFFIX,
     _PLE_SHARD_RE,
@@ -35,6 +98,75 @@ def _context(ids: torch.Tensor, position: int, eos: int) -> list[int]:
     """The two token ids before ``position``; eos pads past the start."""
     return [int(ids[position - 2]) if position >= 2 else eos,
             int(ids[position - 1]) if position >= 1 else eos]
+
+
+def _undrained_context(req: "Req", position: int, eos: int) -> list[int]:
+    """`_context`, over the ids the host knows INCLUDING the ones the drain still owes.
+
+    ⛔⛆ #801 bullet 9j. `req.input_ids` does not see the batch still in flight — `overlap_loop`
+    runs `_forward` before `_process_last_data` — and at one token per step that leaves this read
+    sitting EXACTLY on the last host-known id. An ACCEPTED verify step commits two, and the next
+    fill wants one the drain has not shipped: load 5 died here with
+    `IndexError: index 123 is out of bounds for dimension 0 with size 123`, on both ranks.
+    `spec.host_token_id` resolves it from what `commit_verify` recorded.
+
+    ⛔ It RAISES rather than padding with ``eos`` when an id is genuinely absent. Padding is the
+    cheap move and it would turn a loud host error into a wrong hash window — the store would
+    hash a run the model never saw, on every accepted step, in silence. ⚠ ``eos`` still pads the
+    START of a sequence, which is `_context`'s own rule and is not a missing id.
+    """
+    out: list[int] = []
+    for back in (2, 1):
+        at = position - back
+        if at < 0:
+            out.append(eos)
+            continue
+        token = host_token_id(req, at)
+        if token is None:
+            raise RuntimeError(
+                f"#801: req {req.uid} has no host id at position {at} — input_ids holds "
+                f"{req.input_ids.numel()} and the undrained record holds "
+                f"{sorted(getattr(req, UNDRAINED_IDS, {}))}; cached_len={req.cached_len}, "
+                f"device_len={req.device_len}"
+            )
+        out.append(token)
+    return out
+
+
+def _decode_runs(reqs: Sequence["Req"], tokens: Sequence[int], eos: int) -> list[torch.Tensor]:
+    """#801 bullet 9c: this decode forward's hash runs — ONE per request, carrying every token
+    that request is forwarding, in the batch's own flat row order.
+
+    ``tokens`` is the per-ROW readback of ``batch.input_ids``; ``reqs`` is per REQUEST. A plain
+    decode step is one row each and this is the image's own list comprehension spelled as a loop;
+    a verify step is two rows for a request whose draft is being checked and one for a request
+    beside it whose draft was not produced, and the two cannot be ``zip``ped.
+
+    ⛔ The context is taken ``n`` positions back — ``device_len - n`` IS ``cached_len``, the
+    position this request's FIRST new token sits at — because the run is a window, not a token:
+    `fill` hands the store ``numel() - 2`` rows and the store slides ``(ctx0, ctx1, tok0)``,
+    ``(ctx1, tok0, tok1)`` itself. Taken one back regardless of width, the draft row would hash
+    the committed token's window and the first row would index past the host ids.
+
+    ⛔ The ids come through `_undrained_context`, not `req.input_ids` directly: under overlap the
+    host list is missing the in-flight batch's tokens, and after an ACCEPTED step the one it is
+    missing is one this read needs (#801 bullet 9j).
+
+    ⚠ ``reqs`` is the UNPADDED list on purpose: a padded decode lane stages nothing and reads the
+    zeroed staging, which is what `DiskRowTable.__init__` allocates it for. Padding is appended
+    after the real requests, so walking ``reqs`` consumes the readback's leading rows.
+    """
+    runs: list[torch.Tensor] = []
+    offset = 0
+    for req in reqs:
+        count = req.extend_len
+        runs.append(torch.tensor(
+            [*_undrained_context(req, req.device_len - count, eos),
+             *tokens[offset : offset + count]],
+            dtype=torch.int64,
+        ))
+        offset += count
+    return runs
 
 
 @dataclass(frozen=True)
@@ -187,6 +319,16 @@ class DiskRowTable:
     def fill(self, runs: Sequence[torch.Tensor], *, graph: bool) -> None:
         """Stage per-request token runs (two context ids, then the new tokens) in batch order."""
         pinned = self._graph_pinned if graph else self._eager_pinned
+        # ⛔ #801 bullet 9c: a verify step stages `sum(tokens_per_req)` hash rows, not `bs` of
+        #   them, and `stage` writes straight into the pinned allocation. Derived from the buffer
+        #   rather than from a remembered constant so it cannot go stale; see the module header
+        #   for why it cannot fire at today's dials.
+        rows = sum(int(run.numel()) - 2 for run in runs)
+        capacity = pinned.numel() // self._token_bytes
+        assert rows <= capacity, (
+            f"#801: this step stages {rows} PLE hash rows into a "
+            f"{'graph' if graph else 'eager'} buffer sized for {capacity}"
+        )
         offset = 0
         for run in runs:
             self._store.stage(run.data_ptr(), run.numel() - 2, pinned.data_ptr() + offset * self._token_bytes)
@@ -199,17 +341,19 @@ class DiskRowTable:
         if batch.is_decode:
             reqs = list(batch.reqs)
             if use_graph and self._wait_sync:
-                bs = batch.padded_size
-                self._token_readback[:bs].copy_(batch.input_ids, non_blocking=True)
+                # ⛔ #801 bullet 9c: ROWS, not requests. `batch.input_ids` is one entry per
+                #   forwarded TOKEN (`scheduler._make_input_tuple` walks `Req.extend_len`), so
+                #   `padded_size` here sized the readback for half of a T=2 step and `copy_`
+                #   raised on the shape. Same arithmetic as `_make_positions`.
+                rows = sum(r.extend_len for r in batch.padded_reqs)
+                self._token_readback[:rows].copy_(batch.input_ids, non_blocking=True)
                 self._readback_event.record(torch.cuda.current_stream(self._device))
 
                 def _complete() -> None:
                     try:
                         self._readback_event.synchronize()
-                        tokens = self._token_readback[:bs].to(torch.int64).tolist()
-                        runs = [torch.tensor([*_context(r.input_ids, r.device_len - 1, eos), t], dtype=torch.int64)
-                                for r, t in zip(reqs, tokens)]
-                        self.fill(runs, graph=True)
+                        tokens = self._token_readback[:rows].to(torch.int64).tolist()
+                        self.fill(_decode_runs(reqs, tokens, eos), graph=True)
                     except BaseException:
                         from freetoken.kernel import _ple_store
 
@@ -220,9 +364,7 @@ class DiskRowTable:
                 return _complete
             # launch-gating: this D2H is the step's readback and orders the fill after sampling
             tokens = batch.input_ids.to("cpu").to(torch.int64).tolist()
-            runs = [torch.tensor([*_context(r.input_ids, r.device_len - 1, eos), t], dtype=torch.int64)
-                    for r, t in zip(reqs, tokens)]
-            self.fill(runs, graph=use_graph)
+            self.fill(_decode_runs(reqs, tokens, eos), graph=use_graph)
             return None
         runs = [
             torch.cat((

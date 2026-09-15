@@ -6,8 +6,59 @@ from typing import TYPE_CHECKING, List, Tuple
 
 import torch
 from freetoken.core import Req
+
+# ── #801 overlay marker ──────────────────────────────────────────────────────────────────────
+# This file is `scheduler/cache.py` from image
+# `llm-server/freetoken-gfx1201:2026-09-09-agree-0022` (md5 333a6d8572b8ae2ce29a278a2ff29e09,
+# 706 lines) plus THREE edits: `allocate_paged` (`#801 bullet 8`), `_padded_tail`
+# (`#801 bullet 9ak`) and `_cache_req_hybrid`'s own tail free (`#801 bullet 9an` -- the hybrid
+# branch NEVER calls `_padded_tail`, which is why 9ak demonstrably ran and the ledger still did
+# not balance) -- the ALLOC and the FREE side of one page ledger, which must read one
+# number (`spec.owned_page_end`) or the pool drains. Load 17 died of them disagreeing.
+# ⭐ #801 bullet 9bb adds NO fourth method: the retire-time ledger instrument lives entirely
+# inside `_cache_req_hybrid`, behind `FREETOKEN_MTP801_LEDGER` (default 0, off), because LOAD 21
+# showed the three landed fixes mounted AND the box still leaking -- so this method's arithmetic
+# is now measured on hardware instead of modelled at the desk. ⛔ In no image, in no
+# Dockerfile ladder: `arm_mtp_801.sh`'s OVERLAY and ORIGS lists or the row runs the image's copy
+# silently (#866). A source-level differential against the `.orig` is gated by
+# ./check_verify_wiring_801.sh.
+#
+# ⛔⛆ WHY AN EVERY-SERVED-ROW FILE IS TOUCHED AT ALL, AND THE LEAK IS SILENT END TO END.
+#   `allocate_paged` charges `[div_ceil(cached_len), div_ceil(device_len))`. With the deployed
+#   64-token pages a verify step at C = 63 reaches device_len = 65 and pulls page index 1. Reject,
+#   and `cached_len` rolls back to 64 -- but page 1 is already allocated and already in the page
+#   table. The next step recomputes div_ceil(64) = 1, allocates page 1 a SECOND time and writes
+#   the new slots over the same row. The first page is now referenced by nothing, and every free
+#   path walks the page table, so it is never returned. No exception, no log line; the pool just
+#   drains. `spec.pages_for_step` is the monotone per-request high-water that prevents it.
+#
+# ⭐ IDENTICAL FOR A REQUEST THAT NEVER SPECULATED: the high-water attribute is absent, the `max`
+#   degrades to `div_ceil(cached_len)`, and the flag-off row allocates exactly the pages it
+#   allocates now. Gated over a spread of lengths rather than argued.
+#
+# ⛔ MODEL-AGNOSTIC in the same shape as every other #801 engine-file edit -- an in-function
+#   import of the one helper, so nothing about qwen4exp is loaded on a row that never speculates.
+
 from freetoken.kvcache import BaseCacheHandle, MatchResult, create_prefix_cache
 from freetoken.utils import align_down, div_ceil
+
+# ⛔⛆ #801 r6 b9ar: THE RUNTIME MARKER, and its absence is why three landed fixes could not be
+#   told apart from three fixes that never ran. Every other overlay on this row prints one; this
+#   file printed only the COMMENT above, which emits nothing. Load 20's log carries five
+#   `overlay ACTIVE` lines and none of them is this file, so "the page-ledger fix ran" was an
+#   inference from the mount list, never an observation -- #866's shape, one level out, and the
+#   round already paid for that lesson with `tokenizer/detokenize.py` (9ap).
+#   ⭐ The scheduler is its own PROCESS (server/launch.py::_run_scheduler), so a marker from the
+#   frontend or the model would not have covered it either.
+import sys as _ft801_sys
+
+print(
+    "[#801] overlay ACTIVE: scheduler/cache.py bind-mounted from the repo "
+    f"(pid {os.getpid()}, base md5 333a6d8572b8ae2ce29a278a2ff29e09, "
+    f"FREETOKEN_MTP801_VERIFY={os.getenv('FREETOKEN_MTP801_VERIFY', '<unset>')})",
+    file=_ft801_sys.stderr,
+    flush=True,
+)
 
 if TYPE_CHECKING:
     from .utils import PendingReq
@@ -278,11 +329,14 @@ class CacheManager:
             self.swa_pool.free_swa(indices)
 
     def allocate_paged(self, reqs: List[Req]) -> None:
+        from freetoken.models.qwen4_exp.spec import pages_for_step  # #801 bullet 8
+
         needed_pages = 0
         allocation_info: List[Tuple[int, int, int]] = []
         for req in reqs:
-            first_page = div_ceil(req.cached_len, self.page_size)
-            last_page = div_ceil(req.device_len, self.page_size)
+            # #801 bullet 8: `[max(div_ceil(cached_len), high_water), div_ceil(device_len))` --
+            # see this file's header for the page the rollback would otherwise strand.
+            first_page, last_page = pages_for_step(req, page_size=self.page_size)
             if last_page > first_page:
                 needed_pages += last_page - first_page
                 allocation_info.append((req.table_idx, first_page, last_page))
@@ -367,11 +421,79 @@ class CacheManager:
         old_handle = req.cache_handle
         page_indices = self.page_table[req.table_idx, : req.cached_len]
 
+        # ⛔⛆ #801 bullet 9bb: THE RETIRE-TIME LEDGER, and it exists because LOAD 21 PROVED
+        #   THE DESK MODEL WRONG. 9az's fix was mounted (md5-verified against the repo overlay) and
+        #   the box still raised `free_pages(4094) + cache_pages(1) != num_pages(4096)` -- so
+        #   `repro_page_ledger_801.drain_step` does not describe the deployed drain, and the next
+        #   step is to MEASURE this method's own arithmetic on hardware rather than derive it at the
+        #   desk a third time. It records, per finishing request: the 9az invariant
+        #   (`ids_numel` vs `cached_len`), the allocation ceiling both sides must read
+        #   (`owned_page_end`), what each donate actually seated (`insert_len` -> `prefix_len`),
+        #   and the page count EVERY `_free` in this method returned.
+        # ⭐ OFF BY DEFAULT and the budget is read ONCE per CacheManager, so a row that does not
+        #   set the dial pays one `getattr` per finish and nothing else. The dial is
+        #   `FREETOKEN_MTP801_LEDGER=N` (first N finishes), set by `arm_mtp_801.sh` from
+        #   `FT801_LEDGER` -- round 5 bullet 7c's rule: a dial the launcher cannot set is off.
+        # ⛔ Contained ENTIRELY inside this method on purpose: `test_verify_wiring_801.py`'s
+        #   differential pins the changed set to {allocate_paged, _padded_tail, _cache_req_hybrid},
+        #   and instrumenting `_free` or `check_integrity` would be a fourth name.
+        _ft801 = None
+        if finished:
+            _ft801_left = getattr(self, "_ft801_ledger_left", None)
+            if _ft801_left is None:
+                _ft801_left = int(os.getenv("FREETOKEN_MTP801_LEDGER", "0") or 0)
+            if _ft801_left > 0:
+                self._ft801_ledger_left = _ft801_left - 1
+                from freetoken.models.qwen4_exp.spec import owned_page_end
+                _ft801 = {
+                    "uid": getattr(req, "uid", None),
+                    "cached_len": int(req.cached_len),
+                    "device_len": int(getattr(req, "device_len", -1)),
+                    # ⭐⭐ THE 9az INVARIANT, on the box: these two must be equal at retire.
+                    "ids_numel": int(_cache_ids(req).numel()),
+                    "input_numel": int(req.input_ids.numel()),
+                    "handle_cached_len": int(old_handle.cached_len),
+                    "page_size": int(self.page_size),
+                    "owned_page_end": int(owned_page_end(req, page_size=self.page_size)),
+                    "free_slots_before": int(len(self.free_slots)),
+                    "freed": [],
+                    "frozen": None,
+                    "donate": None,
+                    "tail_start": None,
+                    "branch": None,
+                }
+            else:
+                self._ft801_ledger_left = _ft801_left
+
+        def _ft801_free(indices):
+            """`self._free`, plus the page count it returned when the ledger is armed."""
+            if _ft801 is not None:
+                _ft801["freed"].append(int(indices.numel()))
+            self._free(indices)
+
+        def _ft801_emit(branch):
+            if _ft801 is None:
+                return
+            import json as _ft801_json
+
+            _ft801["branch"] = branch
+            _ft801["free_slots_after"] = int(len(self.free_slots))
+            _ft801["freed_total"] = sum(_ft801["freed"])
+            print("[#801] ledger: " + _ft801_json.dumps(_ft801),
+                  file=_ft801_sys.stderr, flush=True)
+
         if self._mm_bypass(req):
             self.unlock(old_handle)
             if finished:
-                self._free(page_indices[old_handle.cached_len :])
+                _ft801_free(page_indices[old_handle.cached_len :])
+                # ⛔ #801 b9an: same remainder, same reasoning as the main finish below.
+                if _ft801 is not None:
+                    _ft801["tail_start"] = (
+                        -(-req.cached_len // self.page_size) * self.page_size)
+                _ft801_free(self._padded_tail(
+                    req, -(-req.cached_len // self.page_size) * self.page_size))
                 self._free_req_slots(req)
+                _ft801_emit("mm_bypass")
             return
 
         if finished:
@@ -383,10 +505,50 @@ class CacheManager:
             # the tree or freed here) and both ping-pong refs are dropped before
             # _free_req_slots so nothing double-frees.
             free_upto = old_handle.cached_len
+            # ⛔⛆ #801 bullet 9bf: THE SEAT LENGTH, AND IT IS NOT `cached_len`. Load 23 measured
+            #   this retire on hardware: `cached_len 128, ids_numel 127, handle_cached_len 64,
+            #   owned_page_end 2, donate insert_len 128 -> prefix_len 64, freed_total 0`. One page
+            #   charged, seated by nobody, freed by nobody -- `free(4094) + cache(1) != 4096`.
+            # ⭐⭐⭐ THE CAUSE IS THE OVERLAP'S LAST FORWARD, not a lost token (9be refuted that:
+            #   `published == committed` on all 38 `pubcheck` rows). Overlap scheduling launches
+            #   one more forward for a request that terminated in the PREVIOUS drain;
+            #   `spec.commit_verify` advances `cached_len` for it, and its own drain hits
+            #   ``if req in self.finished_reqs: continue`` and appends nothing. This method runs
+            #   inside the FINISHING drain, one iteration earlier -- so `cached_len` already
+            #   carries that forward and the host ids never will. At the finishing drain the lag
+            #   is exactly ``a - 1`` for that forward's accepted length: it ACCEPTED (a = 2) ⇒
+            #   short by one ⇒ leak; it rejected (a = 1) ⇒ level ⇒ no leak. ⇒ ~α of retires.
+            # ⭐⭐ WHAT THE TREE MAY SEAT is therefore the SHORTER of the two, because
+            #   `hybrid_radix_cache.insert` ignores the caller's length and aligns down by
+            #   ``len(input_ids)`` -- offering it 128 ids it does not have returns `prefix_len 64`
+            #   and strands [64, 128). ⛔ USED ONLY WHERE THIS BRANCH DECIDES WHAT THE TREE SEATS,
+            #   never where it decides what to FREE: `page_indices`, the `_free` slices and
+            #   `_padded_tail`'s `owned_page_end` ceiling return the pages that were CHARGED,
+            #   through the ceiling that charged them (9ak's principle -- two sides, one number
+            #   each). Starting the tail at `align_up(n)` instead would strand position 128 again.
+            # ⭐ A NON-SPECULATING ROW IS BYTE-IDENTICAL: it commits the token it forwarded, so
+            #   `ids == cached_len` at retire, the `min` degrades to today's bound and every
+            #   branch below takes the same arm. Gated over both tails in
+            #   `repro_page_ledger_801.sweep_retire_state`.
+            # ⚠ THE COST, and it is accepted on a research row: a LEAKING-SHAPE retire now seats
+            #   NOTHING in the prefix cache (an unaligned `n` skips the donate), so that sequence
+            #   is not a reuse point for the next turn. The pages come back instead of leaking,
+            #   which is the trade 9bf is making.
+            n = min(req.cached_len, _cache_ids(req).numel())
+            # ⭐ #801 b9bf: one field, so load 24's retire row shows the seat length it used --
+            #   `n < cached_len` IS the leaking tail, named rather than re-derived from the pair.
+            if _ft801 is not None:
+                _ft801["n"] = int(n)
             L = req.mamba_last_track_seqlen
             if (
                 L is not None
-                and 0 < L <= req.cached_len
+                # ⛔⛆ #801 b9bf: BOUNDED BY `n`, NOT `cached_len`, and this half is NOT optional.
+                #   `snapshot_toolcall_anchor` sets `mamba_last_track_seqlen` during DECODE at a
+                #   page-aligned `cached_len` -- i.e. on exactly the leaking shape (L = 128 while
+                #   the ids hold 127). Left at `cached_len` this branch inserts the same
+                #   over-advanced length, gets the same short `prefix_len` back, and then pushes
+                #   `free_upto` to L so even a skipped donate frees nothing at all.
+                and 0 < L <= n
                 and align_down(L, self.page_size) == L
                 and req.mamba_ping_pong is not None
             ):
@@ -394,27 +556,78 @@ class CacheManager:
                 frozen = req.mamba_ping_pong[frozen_idx]
                 prefix_len, mamba_exist = self.prefix_cache.insert(
                     _cache_ids(req)[:L], page_indices[:L], frozen)
+                if _ft801 is not None:
+                    _ft801["frozen"] = {"L": int(L), "prefix_len": int(prefix_len),
+                                        "mamba_exist": bool(mamba_exist),
+                                        "free_upto_in": int(free_upto)}
                 pool.free([s for s in req.mamba_ping_pong if mamba_exist or s != frozen])
                 req.mamba_ping_pong = None
-                self._free(page_indices[free_upto : max(free_upto, prefix_len)])
+                _ft801_free(page_indices[free_upto : max(free_upto, prefix_len)])
                 free_upto = max(free_upto, L)
             # Donate the live slot (final full-sequence state). The live state is at cached_len;
             # only attach it when cached_len is itself the page-aligned node boundary (always for
             # page_size==1). For page_size>1 a non-aligned cached_len would attach an over-advanced
             # state to a shorter prefix node -> skip the finish-donate (the ×64 prefill snapshots
             # remain as reuse points).
-            insert_len = align_down(req.cached_len, self.page_size)
+            insert_len = align_down(n, self.page_size)
             keep_live = False
-            if insert_len == req.cached_len and insert_len > 0:
+            if insert_len == n and insert_len > 0:
                 prefix_len, mamba_exist = self.prefix_cache.insert(
                     _cache_ids(req)[:insert_len], page_indices[:insert_len], req.linear_slot_idx)
                 self.unlock(old_handle)
-                self._free(page_indices[free_upto : max(free_upto, prefix_len)])
+                # ⭐⭐ THE PAGES THIS DONATE SEATED. 9az's chain says a short id slice makes
+                #   `hybrid_radix_cache` seat `align_down(len(input_ids), page_size)` and return a
+                #   `prefix_len` BELOW `insert_len`, stranding [prefix_len, insert_len). This is
+                #   that gap, measured instead of argued.
+                if _ft801 is not None:
+                    _ft801["donate"] = {"insert_len": int(insert_len),
+                                        "prefix_len": int(prefix_len),
+                                        "mamba_exist": bool(mamba_exist),
+                                        "free_upto_in": int(free_upto),
+                                        "skipped": False}
+                _ft801_free(page_indices[free_upto : max(free_upto, prefix_len)])
+                # ⛔⛆ #801 b9bf: THE REMAINDER THE TREE DECLINED TO TAKE, and the 9bf FIXTURE
+                #   FOUND IT -- the spec did not have it and the first GREEN run leaked here
+                #   instead. `HybridRadixCache.insert` re-derives its own
+                #   ``insert_len = align_down(len(input_ids), page_size)`` and CLONES
+                #   ``kv_indices[prefix_len:insert_len]`` into the node, so the tree ends up
+                #   holding exactly [0, insert_len) and [insert_len, cached_len) stays the
+                #   REQUEST'S. Before 9bf the donate fired only when ``insert_len == cached_len``,
+                #   so that span was always empty and `_padded_tail(align_up(cached_len))` picked
+                #   up the whole allocated remainder. With the seat length capped at `n` the
+                #   donate can now fire on a retire whose `cached_len` is a token PAST the seat
+                #   (`n` aligned, `cached_len` not: ids 128 against `cached_len` 129) -- the
+                #   dedup free above stops at `prefix_len`, the tail starts at
+                #   ``align_up(cached_len)``, and the page between them is owned by nobody. That
+                #   is the SAME defect 9ak fixed on the other side, re-opened by moving the seat.
+                # ⭐ It is EMPTY whenever ``insert_len == cached_len`` -- every pre-9bf trajectory
+                #   that reached this branch -- so the non-lagging row is unchanged byte for byte.
+                #   ⛔ Floored at `free_upto` so it can never reach back into the locked prefix.
+                _ft801_free(page_indices[max(free_upto, insert_len) :])
                 keep_live = not mamba_exist           # tree now owns linear_slot_idx
             else:
                 self.unlock(old_handle)
-                self._free(page_indices[free_upto :])
+                if _ft801 is not None:
+                    _ft801["donate"] = {"insert_len": int(insert_len), "prefix_len": None,
+                                        "mamba_exist": None, "free_upto_in": int(free_upto),
+                                        "skipped": True}
+                _ft801_free(page_indices[free_upto :])
+            # ⛔⛆ #801 b9an: THE PAGES THE HIGH-WATER SAYS WERE ALLOCATED ABOVE THE COMMITTED
+            #   LENGTH, and load 18 died of them. `page_indices` is
+            #   `page_table[idx, :req.cached_len]`, so every free in this method reaches at most
+            #   `div_ceil(cached_len)` -- while `allocate_paged` charges through
+            #   `spec.owned_page_end`. ⛔ 9ak fixed `_padded_tail`, and THIS METHOD NEVER CALLS IT:
+            #   `cache_type='hybrid_radix'` is the branch the GDN row takes, which is why that fix
+            #   demonstrably ran and the ledger still did not balance.
+            # ⭐ Starting `_padded_tail` at align_up(cached_len) takes exactly the remainder and
+            #   nothing the branches above already returned, and it is an EMPTY slice when no
+            #   high-water was recorded -- so the flag-off row is unchanged byte for byte.
+            if _ft801 is not None:
+                _ft801["tail_start"] = -(-req.cached_len // self.page_size) * self.page_size
+            _ft801_free(self._padded_tail(
+                req, -(-req.cached_len // self.page_size) * self.page_size))
             self._free_req_slots(req, keep_live=keep_live)
+            _ft801_emit("finish")
             return
 
         # Prefill chunk commit: donate the frozen snapshot at the tracked ×64 boundary.
@@ -447,7 +660,12 @@ class CacheManager:
         prefix_len, mamba_exist = self.prefix_cache.insert(
             _cache_ids(req)[:L], page_indices[:L], frozen)
         self.unlock(old_handle)
-        self._free(page_indices[old_handle.cached_len : prefix_len])
+        # ⭐ #801 b9bb: the CHUNK-COMMIT free, routed through the same recorder. It is INERT --
+        #   `_ft801` is only built on a FINISH, so nothing is recorded here today -- but the gate
+        #   that pins "every free in this method goes through the recorder" is then a gate with no
+        #   exception to remember, and a future bullet that arms the ledger for chunk commits gets
+        #   complete accounting instead of a silent under-count.
+        _ft801_free(page_indices[old_handle.cached_len : prefix_len])
         # Lock the committed snapshot node FIRST: the replacement-slot alloc below can trigger
         # evict_mamba (via ensure_mamba_slots), which would otherwise reclaim this still-unlocked
         # just-donated node -- freeing its KV pages under the still-decoding request.
@@ -549,12 +767,24 @@ class CacheManager:
             self.lock(req.cache_handle)
 
     def _padded_tail(self, req: Req, start: int) -> torch.Tensor:
-        """The request's OWN slice [start, page_ceil(cached_len)) of the page table. A finish
-        frees through the page-CEIL bound, not cached_len: allocate_paged allocates (and, when
-        swa_paged, charges swa for) whole pages, so the padding [cached_len, page_ceil) belongs
-        to the finishing request. ``start`` is page-aligned (a match/insert boundary), so the
-        full-pool page bases derived via ``[::page_size]`` are identical to the unpadded slice."""
-        end = div_ceil(req.cached_len, self.page_size) * self.page_size
+        """The request's OWN slice [start, page_ceil) of the page table. A finish frees through the
+        page-CEIL bound, not cached_len: allocate_paged allocates (and, when swa_paged, charges
+        swa for) whole pages, so the padding belongs to the finishing request. ``start`` is
+        page-aligned (a match/insert boundary), so the full-pool page bases derived via
+        ``[::page_size]`` are identical to the unpadded slice.
+
+        ⛔⛆ #801 bullet 9ak: the ceiling is ``owned_page_end``, NOT ``div_ceil(cached_len)``.
+        This bound used to read the committed length, on the premise that the allocation ceiling
+        IS ``div_ceil(cached_len)`` -- true for every row that commits the token it forwarded, and
+        FALSE for a speculating one whose last step REJECTED: that step pulled the page
+        ``device_len`` needs and then committed ``device_len - 1``, leaving the page allocated, in
+        this row, and above the old bound. It was returned to nobody, and ``check_integrity``
+        killed the row at the next idle moment (load 17: free 4094 + cache 1 != 4096).
+        ⭐ Both sides of the ledger now read ONE number; see `spec.owned_page_end`.
+        """
+        from freetoken.models.qwen4_exp.spec import owned_page_end  # #801 bullet 9ak
+
+        end = owned_page_end(req, page_size=self.page_size) * self.page_size
         return self.page_table[req.table_idx, start:end]
 
     def _free_req_slots(self, req: Req, keep_live: bool = False) -> None:

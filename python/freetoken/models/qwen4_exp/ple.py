@@ -1,3 +1,52 @@
+# ── #801 overlay marker ──────────────────────────────────────────────────────────────────────
+# This file is `models/qwen4_exp/ple.py` from image
+# `llm-server/freetoken-gfx1201:2026-09-09-agree-0022` (md5 785a468e97fc669d7b5dad56c0ebf155,
+# 769 lines) BIND-MOUNTED over the installed package, plus this block, `_is_verify_step`, a
+# three-way branch in `build_ple_metadata`'s decode arm, a one-token guard on `_window`'s and
+# `_short_conv`'s fast paths, `PLELayer._verify_conv`, and a `batch=` argument on
+# `commit_ngram_context`. ⛔ In no image, in no Dockerfile ladder: `arm_mtp_801.sh`'s OVERLAY and
+# ORIGS lists or nothing (#866).
+#
+# ⛔⛆ WHY IT EXISTS. PLE never goes through `build_fla_metadata`. It builds its OWN decode
+#   metadata -- `cu_seqlens = arange(bs + 1)`, `seq_lens = (1,) * bs` -- and it carries TWO
+#   per-request recurrences that no other file owns: the short-conv history (`ple_conv`, the last
+#   `(kernel - 1) * ngram_size` raw conv inputs) and the n-gram context (`ple_ngram_ctx`, the last
+#   `ngram_size - 1` token ids). Neither had a rollback point. It is on the deployed row's decode
+#   path, so a verify load was wrong until this landed -- it gated bullet 9 by name from bullet 5.
+#
+# ⛔⛆ AND THE ROUND'S FRAMING OF IT WAS WRONG. Bullets 5-8 recorded this as "the same class of bug
+#   as the GDN half", and bullet 5's bug was SILENT. This one is not: at T > 1 `_window` does
+#   `torch.cat([ngram_context [bs, ctx], input_ids.view(-1, 1) [bs*T, 1]], dim=1)`, `torch.cat`
+#   does not broadcast, and the FIRST verify forward dies with "Sizes of tensors must match except
+#   in dimension 1". ⇒ what the two share is the CAUSE (own decode metadata, no rollback), not the
+#   symptom -- and the silent half is on the other side of the shape fix, where a rejected token
+#   folds into both recurrences forever. `test_ple_verify_801.py::
+#   TestTodaysFileCannotEvenRunAVerifyStep` pins the crash so the claim is a measurement.
+#
+# ⭐ THE CONV NEEDED NO NEW ARITHMETIC, ONLY A WIDER ONE. `_decode_conv` reads taps t-9, t-6, t-3
+#   off the slab and t from the token; `_prefill_conv` already runs exactly that as one dilated
+#   `F.conv1d` over `[state | tokens]`. `_verify_conv` is that call at decode's PRECISION (fp32
+#   products, like `_decode_conv`, not `_prefill_conv`'s model-dtype conv) over a padded
+#   `[bs, W, state_len + T]` -- and, unlike either, it writes NOTHING back.
+#
+# ⛔ NEITHER POOL IS ADVANCED BY A VERIFY FORWARD. That is this file's spelling of bullet 5's
+#   `disable_state_update=True`: both pools still hold the step-ENTRY state afterwards, so an
+#   abandoned step changes nothing and `spec.commit_ple_state` is the ONLY thing that advances
+#   them. What the forward leaves behind is a snapshot of what it CONSUMED (`batch.ple_snapshots`,
+#   `batch.ple_context_snapshot`) -- the entry state is read back off the pool at commit time.
+#
+# ⛔ VRAM, stated rather than discovered. The deployed row has ONE PLE layer (`ple_layer_ids=[2]`),
+#   `ple_state_width = hc_count * hidden_size = 4 * 2560 = 10240` and `ple_conv_state_len = 9`. The
+#   snapshot holds a REFERENCE to this step's conv inputs `[bs*T, 10240]` -- bf16, ~40 KiB per
+#   request at T=2, and no copy at all. Against bullet 5's ~108 MiB of GDN intermediates it does
+#   not round to a line.
+#
+# ⛔⛆ CAPTURE. `model.py` calls `build_ple_metadata` INSIDE the forward, so it runs inside the
+#   captured graph. The uniform-T branch is therefore device arithmetic over the forward's own
+#   token count (`arange(bs + 1) * width`) and touches no host buffer -- a fresh pinned tensor
+#   copied H2D would be read from a freed address on every replay. Only the RAGGED branch stages
+#   a host buffer, and `engine/graph.py` (bullet 6) already refuses to capture a ragged step.
+
 """Per-Layer Embedding (PLE) for Qwen3.8-Flash-Next: hashed n-gram features injected at layer 1.
 
 HF reference: ``Qwen4ExpTextNGramEmbedding`` (modeling_qwen4_exp.py:1018) and
@@ -297,6 +346,16 @@ class PLEMetadata:
     is_decode: bool
 
 
+def _is_verify_step(meta: "PLEMetadata") -> bool:
+    """#801: does this forward carry more than one token for some request?
+
+    ⭐ Asked of the SHAPES, not of a flag: a verify step is still ``is_decode``, and the one-token
+    step is its special case. Every fast path below is guarded on this and is reached, untouched,
+    exactly when it was reached before.
+    """
+    return meta.is_decode and meta.input_ids.shape[0] != len(meta.seq_lens)
+
+
 def _state_slot(req) -> int:
     slot = getattr(req, "linear_slot_idx", None)
     return req.table_idx if slot is None else slot
@@ -339,17 +398,47 @@ def build_ple_metadata(
     if batch.is_decode and slots_dev is not None:
         slots = slots_dev.long()
         bs = slots.numel()
+        # #801: a verify step forwards T tokens for a speculating request, so PLE's indptr is
+        # ragged exactly as a prefill's is -- `arange(bs + 1)` IS its one-token special case, kept
+        # verbatim so the every-served-row step allocates and copies nothing new.
+        total = batch.input_ids.shape[0]
+        lens = [r.extend_len for r in reqs]
+        if total == bs:
+            cu_seqlens = torch.arange(bs + 1, dtype=torch.int32, device=device)
+            seq_lens = (1,) * bs
+        elif sum(lens) == total and min(lens) != max(lens):
+            # ⛔ ragged, and therefore EAGER: this is the one branch that stages a host buffer, and
+            #   `engine/graph.py` refuses to capture a ragged verify step (bullet 6).
+            pin = {"device": "cpu", "pin_memory": torch.cuda.is_available()}
+            cu_seqlens = (
+                torch.tensor([0, *lens], dtype=torch.int32, **pin)
+                .cumsum_(0)
+                .to(device, non_blocking=True)
+            )
+            seq_lens = tuple(lens)
+        else:
+            # ⛔⛆ uniform T, derived from the FORWARD'S OWN SHAPE rather than from `extend_len`:
+            #   a padded capture's padding `Req`s carry `extend_len == 1` while the graph's token
+            #   layout is strided, and trusting them would build a one-token indptr for a
+            #   two-token graph. Pure device arithmetic, so it is capture-safe.
+            width = total // bs
+            assert width * bs == total, (
+                f"#801: a decode forward of {total} tokens over {bs} requests is neither one "
+                f"token each nor a uniform verify step, and its lengths {lens} do not sum to it"
+            )
+            cu_seqlens = torch.arange(bs + 1, dtype=torch.int32, device=device) * width
+            seq_lens = (width,) * bs
         return PLEMetadata(
             input_ids=batch.input_ids,
-            cu_seqlens=torch.arange(bs + 1, dtype=torch.int32, device=device),
-            seq_lens=(1,) * bs,
+            cu_seqlens=cu_seqlens,
+            seq_lens=seq_lens,
             ngram_context=context_pool.index_select(0, slots).long(),
             state_slots=slots,
             fresh_slots=None,
             is_decode=True,
         )
 
-    lens = [r.extend_len for r in reqs]
+    lens = [r.extend_len for r in reqs]  # #801: rebound here for the prefill path below
     if fla is not None and fla.has_initial_state is not None:
         cu = fla.cu_seqlens
         slots = fla.cache_indices.long()
@@ -372,18 +461,42 @@ def build_ple_metadata(
     )
 
 
-def commit_ngram_context(meta: PLEMetadata, fla, context_pool: torch.Tensor | None = None) -> None:
+def commit_ngram_context(
+    meta: PLEMetadata, fla, context_pool: torch.Tensor | None = None, batch=None
+) -> None:
     """Roll each request's ``ple_ngram_ctx`` forward past this forward's tokens.
 
     Called ONCE per forward after every PLE layer ran (the layers only read the context);
     also writes the boundary-aligned window to the track slot so a donated snapshot restores
     the context together with the conv state. Pure device arithmetic, capture-safe.
+
+    ⛔⛆ #801: ON A VERIFY STEP THIS ADVANCES NOTHING. Some of the tokens it is being asked to roll
+    in are DRAFTS that the sampler is about to reject, and the n-gram context is a recurrence --
+    once a rejected id is in the window there is no way back, and the row hashes against a token
+    it never emitted for the rest of the sequence, silently. So the step is recorded on the batch
+    and `spec.commit_ple_state` rolls the context forward by exactly ``accepted_len`` instead.
+    ⛔ ``batch`` is therefore REQUIRED on a verify step rather than defaulted away: a call site
+    that forgot it would be the silent-advance bug, so it raises.
     """
     if context_pool is None:
         context_pool = _ngram_context_pool()
     ids = meta.input_ids.long()
     ctx_len = meta.ngram_context.shape[1]
     steps = torch.arange(ctx_len, device=ids.device)
+    if _is_verify_step(meta):
+        from .spec import PLEContextSnapshot
+
+        assert batch is not None, (
+            "#801: commit_ngram_context was handed a verify step with no batch to record it on -- "
+            "there is nowhere to put the snapshot spec.commit_ple_state needs, and rolling the "
+            "context here would fold this step's REJECTED drafts into it permanently"
+        )
+        batch.ple_context_snapshot = PLEContextSnapshot(
+            input_ids=ids,
+            cu_seqlens=meta.cu_seqlens,
+            state_slots=meta.state_slots,
+        )
+        return
     if meta.is_decode:
         nxt = torch.cat([meta.ngram_context[:, 1:], ids.view(-1, 1)], dim=1)
     else:
@@ -445,7 +558,12 @@ class NGramEmbedding(BaseOP):
         """The hash window as ``(packed [B, W], select)``, where ``select`` picks this forward's tokens."""
         ids = meta.input_ids.long()
         ctx_len = self.ngram_size - 1
-        if meta.is_decode:
+        # #801: the fast path assumes ONE row of `ids` per request. On a verify step there are T,
+        # and `torch.cat` does not broadcast -- so today's file dies here rather than hashing
+        # wrongly. The packed path below is already right for it: it reads `cu_seqlens` and
+        # `seq_lens`, which `build_ple_metadata` now widens, and it hashes token 2 against token 1
+        # OF THE SAME FORWARD rather than against the stale context.
+        if meta.is_decode and not _is_verify_step(meta):
             # a window of exactly ngram_size columns holds every shift the hash can reach
             return torch.cat([meta.ngram_context, ids.view(-1, 1)], dim=1), lambda t: t[:, -1]
 
@@ -656,7 +774,7 @@ class PLELayer(BaseOP):
         fla = getattr(batch, "fla_metadata", None)
         if fla is not None and fla.track_boundary_row is not None:
             self._write_track_snapshot(states, x, fla)
-        return gated + self._short_conv(x, meta, states)
+        return gated + self._short_conv(x, meta, states, batch)
 
     def _write_track_snapshot(self, states: torch.Tensor, x: torch.Tensor, fla) -> None:
         """Copy the conv history at the GDN track boundary into the same donatable slot, so a radix
@@ -685,12 +803,70 @@ class PLELayer(BaseOP):
         return state
 
     def _short_conv(
-        self, x: torch.Tensor, meta: PLEMetadata, states: torch.Tensor
+        self, x: torch.Tensor, meta: PLEMetadata, states: torch.Tensor, batch=None
     ) -> torch.Tensor:
         """silu of the dilated depthwise conv over [state | x], and roll the per-request state."""
+        # #801: the batched 4-tap read assumes ONE row of `x` per request, and `torch.cat` does not
+        # broadcast, so a verify step dies here too rather than convolving wrongly.
+        if _is_verify_step(meta):
+            return self._verify_conv(x, meta, states, batch)
         if meta.is_decode:
             return self._decode_conv(x, meta, states)
         return self._prefill_conv(x, meta, states)
+
+    def _verify_conv(
+        self, x: torch.Tensor, meta: PLEMetadata, states: torch.Tensor, batch
+    ) -> torch.Tensor:
+        """#801: the short conv over T tokens per request, advancing NOTHING.
+
+        ⭐ The arithmetic is `_decode_conv`'s, widened: output column ``j`` reads history columns
+        ``j, j+d, j+2d, j+3d`` of ``[state | tokens]``, which for ``j = 0`` is exactly the taps
+        ``t-9, t-6, t-3, t`` the batched read takes -- and for ``j = 1`` is exactly what those taps
+        would be after rolling the state once. One dilated `F.conv1d` does every column at once,
+        the same call `_prefill_conv` makes, at `_decode_conv`'s fp32 PRECISION rather than
+        `_prefill_conv`'s model-dtype one, because this step is standing in for decode steps.
+
+        ⛔⛆ It writes no state. That is this file's `disable_state_update=True`: the pool still
+        holds the step-ENTRY window afterwards, an abandoned step changes nothing, and
+        `spec.commit_ple_state` is the only advance. What is recorded is what the step CONSUMED --
+        the RAW conv inputs, which is what the window is rebuilt from.
+
+        ⚠ Ragged steps are padded to ``max(seq_lens)`` and the padding columns' outputs are simply
+        not selected; the packing indices are device arithmetic over `cu_seqlens`, so this is
+        capture-safe at the uniform width `engine/graph.py` will capture (bullet 6).
+        """
+        from .spec import PLESnapshot
+
+        assert batch is not None, (
+            "#801: PLELayer.forward ran a verify step with no batch to record it on -- there is "
+            "nowhere to put the snapshot spec.commit_ple_state needs, and returning here would "
+            "leave the conv history frozen at the step-entry window forever"
+        )
+        num_reqs, width = len(meta.seq_lens), x.shape[1]
+        tokens = max(meta.seq_lens)
+        cu = meta.cu_seqlens.long()
+        flat_pos = torch.arange(x.shape[0], device=x.device)
+        req = (torch.searchsorted(cu, flat_pos, right=True) - 1).clamp_(max=num_reqs - 1)
+        col = flat_pos - cu[req]
+
+        packed = x.new_zeros((num_reqs, tokens, width))
+        packed[req, col] = x
+        state = self._read_state(meta, states, x.dtype)
+        history = torch.cat([state, packed.transpose(1, 2)], dim=-1).float()
+        out = F.conv1d(
+            history, self.conv1d.weight.float(), groups=width, dilation=self.dilation
+        ).to(x.dtype)
+
+        snapshots = getattr(batch, "ple_snapshots", None)
+        if snapshots is None:
+            snapshots = {}
+            batch.ple_snapshots = snapshots
+        snapshots[self.layer_id] = PLESnapshot(
+            conv_inputs=x,
+            cu_seqlens=meta.cu_seqlens,
+            state_slots=meta.state_slots,
+        )
+        return F.silu(out.transpose(1, 2)[req, col])
 
     def _decode_conv(
         self, x: torch.Tensor, meta: PLEMetadata, states: torch.Tensor

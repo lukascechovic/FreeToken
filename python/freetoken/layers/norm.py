@@ -75,6 +75,44 @@ class GemmaRMSNorm(BaseOP):
         return x, residual
 
 
+# ── #801 overlay marker ──────────────────────────────────────────────────────────────
+# This file is `layers/norm.py` from image `llm-server/freetoken-gfx1201:2026-09-09-agree-0022`
+# (md5 8dec317a893facd831cd45a7ff8e19d7, 195 lines) BIND-MOUNTED over the installed package, plus
+# this block and the CPU branch inside `GemmaPlusOneRMSNorm`. ⛔ It is NOT a patch in the
+# Dockerfile ladder and NOT in any image.
+#
+# ⛔⛆ WHY IT EXISTS. `GemmaPlusOneRMSNorm` dispatched UNCONDITIONALLY to flashinfer's or triton's
+#   `gemma_rmsnorm`, so it could not run off a GPU at all: in a CPU-only container it raised
+#   `RuntimeError: 0 active drivers ([])`. It is also the class the MTP head's two fusion norms
+#   must be (#801 round 4, finding 2 -- ONE statistic over all `hc_count*hidden`, not one per
+#   stream), so the round's agreed EXACT off-GPU gate had no interpreter until this branch existed.
+#   `GroupedPlusOneRMSNorm` (models/qwen4_exp/hc.py:56-60) already had exactly this branch; the
+#   shape below is copied from it, and `hc.grouped_plus_one_rms_norm(..., num_groups=1)` is the
+#   independent implementation the new one is gated against.
+#
+# ⚠ NO MARKER PRINT, unlike `overlay/weight.py`. That file prints because a mount that silently
+#   did not take is INVISIBLE there -- the row loads the image's weights and every log line looks
+#   like the arm you launched (#866). Here a failed mount is loud on CPU (the driver error above)
+#   and a no-op on GPU (the branch is dead code there), and this module is imported by every norm
+#   in the engine, so a print would be noise on the load. The suite asserts the mount took by md5
+#   instead: `test_mtp_801.py::TestTheOverlayTookEffect`.
+#
+# ⚠ `GemmaPlusOneRMSNormFused` is deliberately NOT given a branch: nothing this round constructs
+#   one off-GPU, and an unexercised CPU path is a claim, not a capability.
+
+
+def gemma_plus_one_rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """RMSNorm over the WHOLE last dim on an fp32 statistic, then scale by (1+w).
+
+    The pure-torch body of :class:`GemmaPlusOneRMSNorm`, written out so the CPU path and the
+    (1+w) semantics can be tested without a GPU. Mirrors ``hc.grouped_plus_one_rms_norm``: fp32
+    intermediates, cast back at the store, so the two agree to fp32 rounding.
+    """
+    xf = x.float()
+    xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
+    return (xf * (1.0 + weight.float())).to(x.dtype)
+
+
 class GemmaPlusOneRMSNorm(BaseOP):
     """(1 + w)-scaled RMSNorm (Gemma semantics: the checkpoint stores ``scale - 1``
     and the effective multiplier is ``1 + weight``, added in fp32 at runtime --
@@ -110,9 +148,16 @@ class GemmaPlusOneRMSNorm(BaseOP):
         return x.view(-1, self.size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # #801: the kernels are GPU-only; off a GPU take the torch chain (see the overlay marker)
+        if not x.is_cuda:
+            return gemma_plus_one_rms_norm(x, self.weight, self.eps)
         return self.gemma_rmsnorm(self._flat(x), self.weight, self.eps).view(x.shape)
 
     def forward_inplace(self, x: torch.Tensor) -> None:
+        if not x.is_cuda:
+            # computed in full first: the fp32 chain reads every element of the row it writes
+            x.copy_(gemma_plus_one_rms_norm(x, self.weight, self.eps))
+            return
         flat = self._flat(x)
         self.gemma_rmsnorm(flat, self.weight, self.eps, out=flat)
 

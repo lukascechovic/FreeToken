@@ -9,6 +9,77 @@ import torch
 from .base import StateLessOP
 
 
+# ── #801 overlay marker ──────────────────────────────────────────────────────────────
+# This file is `layers/rotary.py` from image `llm-server/freetoken-gfx1201:2026-09-09-agree-0022`
+# (md5 be50e942799f264c10414d28c2c3340d, 234 lines) BIND-MOUNTED over the installed package, plus this block
+# and the CPU branch inside `RotaryEmbedding.forward`. ⛔ It is NOT a patch in the Dockerfile
+# ladder and NOT in any image.
+#
+# ⛔⛆ WHY IT EXISTS — the SECOND blocker of the same shape as `overlay/norm.py`'s, found by
+#   running round 4 bullet 4, not by reading. `RotaryEmbedding.forward` dispatches
+#   unconditionally to flashinfer's or triton's `apply_rope_with_cos_sin_cache_inplace`; the
+#   triton one opens with `assert query.is_cuda and key.is_cuda and positions.is_cuda`. So
+#   `Qwen4ExpAttention` — which the MTP head reuses whole — could not run off a GPU at all, and
+#   the round's agreed EXACT off-GPU gate cannot cover the head's layer without this branch.
+#
+# ⭐ WHAT THE BRANCH IS DIFFED AGAINST, so it is not merely my second opinion of my first.
+#   The cos/sin CACHE is the engine's, untouched: `__init__` builds `_cos_sin_cache` above and
+#   this branch only consumes it. `head_ref_801.apply_rope` builds its frequencies from scratch
+#   out of the HF definition and knows nothing about the cache's layout. The gate in
+#   `test_mtp_801.py` runs the engine's attention against that reference, so an agreement is a
+#   real cross-check of the cache layout, not a restatement.
+#   ⚠ The rotation itself is transcribed from `kernel/triton/rope.py::_rope_tiled`: cos is the
+#   FIRST half of each cache row and sin the second, both over `rotary_dim`; NeoX pairs `d` with
+#   `d + rotary_dim/2`, interleave pairs `2d` with `2d+1`; fp32 math, cast back at the store;
+#   dims past `rotary_dim` pass through untouched.
+#
+# ⚠ No marker print, for the reasons `overlay/norm.py` gives: a failed mount is loud on CPU and
+#   a no-op on GPU (this branch is dead code there), and the suite asserts the mount by md5.
+
+
+def apply_rope_with_cos_sin_cache_torch(
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    head_size: int,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool = True,
+) -> None:
+    """Pure-torch `apply_rope_with_cos_sin_cache_inplace`, for tensors that are not on a GPU.
+
+    ``query``/``key`` are ``[nnz, num_heads*head_size]`` and are rotated IN PLACE over their
+    first ``rotary_dim`` dims; ``cos_sin_cache`` is ``[max_position, rotary_dim]`` fp32.
+    """
+    if cos_sin_cache.dtype is not torch.float32:
+        raise ValueError("cos_sin_cache should be float32")
+    nnz = query.shape[0]
+    if nnz == 0:
+        return
+    rotary_dim = cos_sin_cache.shape[1]
+    half = rotary_dim // 2
+
+    row = cos_sin_cache[positions.to(torch.int64)]  # [nnz, rotary_dim]
+    cos = row[:, None, :half]  # [nnz, 1, half], broadcast over heads
+    sin = row[:, None, half:]
+
+    if is_neox:
+        d0 = torch.arange(half, device=query.device)
+        d1 = d0 + half
+    else:  # GPT-J interleave: adjacent pairs
+        d0 = torch.arange(0, rotary_dim, 2, device=query.device)
+        d1 = d0 + 1
+
+    for tensor in (query, key):
+        heads = tensor.view(nnz, -1, head_size)
+        x0 = heads[..., d0].float()
+        x1 = heads[..., d1].float()
+        # both halves are read before either is written: the rotation mixes them
+        out0 = (x0 * cos - x1 * sin).to(tensor.dtype)
+        out1 = (x1 * cos + x0 * sin).to(tensor.dtype)
+        heads[..., d0] = out0
+        heads[..., d1] = out1
+
+
 class RotaryEmbedding(StateLessOP):
     def __init__(
         self,
@@ -74,6 +145,17 @@ class RotaryEmbedding(StateLessOP):
         query: torch.Tensor,
         key: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # #801: the kernels are GPU-only; off a GPU take the torch chain (see the overlay marker)
+        if not query.is_cuda:
+            apply_rope_with_cos_sin_cache_torch(
+                positions=positions,
+                query=query,
+                key=key,
+                head_size=self.head_size,
+                cos_sin_cache=self._cos_sin_cache,
+                is_neox=self.is_neox,
+            )
+            return query, key
         self.apply_rope_with_cos_sin_cache_inplace(
             positions=positions,
             query=query,

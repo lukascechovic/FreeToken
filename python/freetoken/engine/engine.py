@@ -19,7 +19,7 @@ from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cach
 from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
 
 from .config import EngineConfig
-from .graph import GraphRunner, get_free_memory
+from .graph import GraphRunner, _determine_cuda_graph_bs, get_free_memory
 from .sample import BatchSamplingArgs, Sampler
 from freetoken.kvcache import create_kv_pool, resolve_pool_class
 from freetoken.kvcache.base import CacheRebuildRejected
@@ -29,6 +29,26 @@ from freetoken.kvcache.linear_state_pool import (
 )
 
 logger = init_logger(__name__)
+
+# ── #801 overlay marker ──────────────────────────────────────────────────────────────────────
+# This file is `engine/engine.py` from image
+# `llm-server/freetoken-gfx1201:2026-09-09-agree-0022` (md5 02902f4aa338362de63767c0523dbfd4,
+# 1524 lines) BIND-MOUNTED over the installed package, plus this block and the draft-head pool
+# sizing marked `#801 bullet 7` below. ⛔ It is NOT a patch in the Dockerfile ladder and is in NO
+# image. ⚠ A `-v` that silently does not take leaves the row running the IMAGE's engine while
+# every log line looks like the arm we think we launched (#866) -- hence a marker, on stderr,
+# before the engine's logging is up.
+import json as _ft801_json
+import sys as _ft801_sys
+
+print(
+    "[#801] overlay ACTIVE: engine/engine.py bind-mounted from the repo "
+    f"(pid {os.getpid()}, base md5 02902f4aa338362de63767c0523dbfd4, "
+    f"FREETOKEN_LOAD_MTP={os.getenv('FREETOKEN_LOAD_MTP', '<unset>')}, "
+    f"FREETOKEN_MTP801_RUN_HEAD={os.getenv('FREETOKEN_MTP801_RUN_HEAD', '<unset>')})",
+    file=_ft801_sys.stderr,
+    flush=True,
+)
 
 
 def _require_offload_cache_size(cache_size: int, num_experts: int) -> None:
@@ -317,6 +337,39 @@ class Engine:
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
         self.model.load_state_dict(self._load_weight_state_dict(config))
+        # ── #801 bullet 7: the draft head's three pools ──────────────────────────────────
+        # A model that built a draft head answers `mtp_pool_model_config` with the config the
+        # engine's POOLS must be sized from -- the head's layer id owned by an attention group,
+        # one more index layer, and (nvfp4 only) one more MoE layer. Every other model has no such
+        # method and nothing below changes. ⛔ It is applied HERE, after `create_model` and after
+        # `_load_weight_state_dict`: both build/validate against `num_layers` and would try to
+        # make a 49th BACKBONE layer out of a checkpoint that has 48.
+        # ⛔ The backbone's own config is kept, because the expert-bank loader still reads the
+        #   checkpoint's 48 MoE layers; the head's experts come from its own bank (below).
+        # ⛔⛆ #801 round 5 bullet 7a: TWO deltas, not one, because they come apart. The head's
+        #   ATTENTION layer exists under either head dtype (`_mtp_pool_layers`), but its MoE layer
+        #   is an `OffloadMoELayer` only under the deployed nvfp4 dial (`_mtp_bank_layers`); under
+        #   round 5 bullet 1's resident-bf16 research dial the head holds its experts as plain
+        #   on-card tensors and there is no bank layer to attach, no cache slot to budget and no
+        #   49th layer for `attach_offload_moe_cache`'s walk to find. Using the LAYER delta to gate
+        #   the BANK work -- which is what this did before 7a -- appends an NVFP4 bank onto a bf16
+        #   head and then dies on that walk's assertion, ~20 min into a load.
+        self._backbone_model_config = config.model_config
+        self._mtp_pool_layers = 0
+        self._mtp_bank_layers = 0
+        if hasattr(self.model, "mtp_pool_model_config"):
+            pooled = self.model.mtp_pool_model_config(config.model_config)
+            self._mtp_pool_layers = pooled.num_layers - config.model_config.num_layers
+            self._mtp_bank_layers = pooled.num_moe_layers - config.model_config.num_moe_layers
+            if self._mtp_pool_layers:
+                logger.info_rank0(
+                    f"#801: sizing the pools for {self._mtp_pool_layers} draft layer(s) "
+                    f"({self._mtp_bank_layers} of them offload-MoE): "
+                    f"num_layers {config.model_config.num_layers} -> {pooled.num_layers}, "
+                    f"num_moe_layers {config.model_config.num_moe_layers} -> "
+                    f"{pooled.num_moe_layers}"
+                )
+                object.__setattr__(config, "model_config", pooled)
         post_weights_free = self._sync_get_memory()[0]
         self._weights_bytes = self._baseline_free - post_weights_free
         # Pool-budget baseline for the desktop cache sliders: free VRAM after the weights are
@@ -408,6 +461,33 @@ class Engine:
         if self.linear_state_pool is not None:
             self.dummy_req.linear_slot_idx = self.linear_state_pool.padding_slot
         self.page_table[self.dummy_req.table_idx].fill_(num_tokens)  # point to dummy page
+        if hasattr(self.model, "mtp_reserve_graph_buffers"):
+            # ── #801 bullet 7: BEFORE any capture ───────────────────────────────────────────
+            # A captured decode graph writes into the addresses it was captured with, and an
+            # allocation made DURING `torch.cuda.graph(...)` comes out of the graph's private
+            # pool -- right on the eager warm-up, wrong on every replay. `_capture_graphs` happens
+            # to visit the LARGEST batch size first, which would make lazy allocation work by
+            # accident; this is the line that says so instead. ⛔ The same resolver the runner
+            # itself calls, on the same arguments, so the two cannot disagree -- and the assert
+            # after construction is what proves they did not.
+            _mtp_graph_bs = _determine_cuda_graph_bs(
+                cuda_graph_bs=config.cuda_graph_bs,
+                cuda_graph_max_bs=config.cuda_graph_max_bs,
+                free_memory=init_free_memory,
+            )
+            # decode taps one row per PADDED request, prefill one per request (+ the dummy).
+            _mtp_max_rows = max(max(_mtp_graph_bs, default=0), config.max_running_req + 1)
+            # ⛔⛆ #801 r6 b9cf: A SECOND CURRENCY, AND 9cb SPENT THE FIRST ONE FOR IT. `_mtp_max_rows`
+            #   is a REQUEST count -- the TAP's unit, because the tap takes one row per request.
+            #   HIDDENCHECK's buffer is indexed by TOKEN ROW, and a prefill chunk is the
+            #   scheduler's whole token budget (`prefill_budget = min(max_extend_tokens,
+            #   prefill_chunk_budget)`, so `max_extend_tokens` is its upper bound): 4096 rows
+            #   against a `_mtp_max_rows` of ~160. Sized by rows, layer 0's write raised on BOTH
+            #   ranks at the first prefill, before anything served.
+            # ⭐ The VERIFY width is NOT applied here -- `engine.py` is model-agnostic and the
+            #   model knows its own `mtp_verify_width`. This passes the budget the engine owns.
+            _mtp_max_tokens = int(getattr(config, "max_extend_tokens", 0) or 0)
+            self.model.mtp_reserve_graph_buffers(_mtp_max_rows, _mtp_max_tokens)
         self.graph_runner = GraphRunner(
             stream=self.stream,
             device=self.device,
@@ -421,6 +501,35 @@ class Engine:
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
         )
+        if hasattr(self.model, "mtp_reserve_graph_buffers"):
+            # #801 bullet 7: the reserve above must have covered what the runner actually captured.
+            assert self.graph_runner.max_graph_bs <= _mtp_max_rows, (
+                f"#801: graphs captured up to bs {self.graph_runner.max_graph_bs} but the draft "
+                f"tap's buffer was reserved for {_mtp_max_rows} rows -- the buffer grew INSIDE a "
+                f"capture and every replay writes into the graph's private pool"
+            )
+        if hasattr(self.model, "mtp_set_rank_group"):
+            # ── #801 round 6 bullet 7: the cross-rank verify check's own group ───────────────
+            # `tp_cpu_group` is GLOO on both branches of `_init_communication` and is the only
+            # group here that is. ⛔ The model must not look one up for itself: on the deployed
+            # arm (`--disable-pynccl`) `torch.distributed.group.WORLD` is an NCCL group, so a
+            # default would be right on one configuration and silently wrong on the one #801
+            # round 6 measures — and an agreement that rides the device path hangs exactly when
+            # the ranks are out of step, which is the failure it exists to replace.
+            # ⚠ A no-op unless `FREETOKEN_MTP801_SPECCHECK` is non-zero.
+            self.model.mtp_set_rank_group(
+                self.tp_cpu_group, config.tp_info.size, config.tp_info.rank
+            )
+        if hasattr(self.model, "mtp_capture_draft_graph"):
+            # ── #801 round 5 bullet 6: `t_draft`, captured ───────────────────────────────────
+            # AFTER the backbone's own decode graphs (just above) are captured and warmed --
+            # capturing here, not lazily on the first real shadow step, keeps bullet 5's
+            # `t_draft` EAGER timing clean (no first-call capture tax hiding inside a measured
+            # step) and matches `reserve_multi_stream`'s own ordering rule: nothing may allocate
+            # during a capture, and this hook's own graph is one more thing that must not.
+            self.model.mtp_capture_draft_graph(
+                self.attn_backend, self.stream, self.graph_runner.dummy_req
+            )
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
             self._warmup_prefill()
@@ -524,6 +633,14 @@ class Engine:
             cpu_layer_ids = _auto_cpu_layers(
                 config, config.model_config.num_moe_layers, reserved=self._host_tables_bytes
             )
+        if self._mtp_bank_layers:
+            # #801 bullet 7: the head runs on EVERY step and its bank is one layer; routing it to
+            # the CPU executor would be a different experiment (and `_auto_cpu_layers` picks TAIL
+            # layers, which is exactly where the head's id lands). ⛔ Not a fix to the auto policy:
+            # the backbone's own set is untouched.
+            cpu_layer_ids = frozenset(
+                i for i in cpu_layer_ids if i < self._backbone_model_config.num_moe_layers
+            )
         if config.moe_backend == "hybrid":
             decode_target = "hybrid"
         elif cpu_layer_ids:
@@ -573,11 +690,11 @@ class Engine:
                 requested_residency = [
                     HostResidency.LOCKED.value if i in cpu_layer_ids
                     else HostResidency.PINNED.value
-                    for i in range(config.model_config.num_moe_layers)
+                    for i in range(self._backbone_model_config.num_moe_layers)  # #801: backbone only
                 ]
             banks = load_expert_banks(
                 config.model_path,
-                config.model_config,
+                self._backbone_model_config,  # #801 bullet 7: the CHECKPOINT's MoE layers, not the head's
                 device=self.device,
                 dtype=self.dtype,
                 dummy=config.use_dummy_weight,
@@ -585,6 +702,38 @@ class Engine:
                 decode_target=("cpu" if decode_target in ("cpu", "hybrid") else "gpu"),
                 layer_residency=requested_residency,
             )
+            if self._mtp_bank_layers:
+                # ── #801 bullet 7: the head's experts, as extra LAYERS on the same banks ─────
+                # Round 2 built them as an NVFP4 source bank in exactly the shape
+                # `load_nvfp4_expert_sources` returns, so appending is the whole attachment: the
+                # offload cache then sees a 49th layer with nothing special about it, and the
+                # `--moe-cache-auto` budget below prices its 512 experts like any other layer's.
+                # ⛔ Appended BEFORE the budget is solved, for that reason.
+                extra = self.model.mtp_expert_source_banks(
+                    self._backbone_model_config, banks.quant_format
+                )
+                for name, per_layer in extra.items():
+                    if name not in banks.sources:
+                        raise ValueError(
+                            f"#801: the draft bank has {name!r}, which is not in the "
+                            f"{banks.quant_format!r} schema {sorted(banks.sources)}"
+                        )
+                    if len(per_layer) != self._mtp_bank_layers:
+                        raise ValueError(
+                            f"#801: the draft bank holds {len(per_layer)} layer(s) of {name!r}, "
+                            f"but the pools were sized for {self._mtp_bank_layers}"
+                        )
+                    banks.sources[name].extend(per_layer)
+                if banks.layer_residency is not None:
+                    from freetoken.moe.host_banks import HostResidency
+
+                    banks.layer_residency.extend(
+                        [HostResidency.PINNED.value] * self._mtp_bank_layers
+                    )
+                logger.info_rank0(
+                    f"#801: attached the draft head's expert bank as layer(s) "
+                    f"{list(range(self._backbone_model_config.num_moe_layers, config.model_config.num_moe_layers))}"
+                )
             if config.moe_cache_auto:
                 size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks)
                 object.__setattr__(config, "moe_cache_size", size)
@@ -915,6 +1064,84 @@ class Engine:
             moe_offload_cache=self.moe_offload_cache,
         )
 
+    #: #801 r6 b9bw: fp → int bit view, by element width. ⛔ A dtype missing here is one
+    #: hashed by VALUE, which for floats is the one thing this instrument may not do.
+    _FT801_BITS = {
+        torch.float64: torch.int64,
+        torch.float32: torch.int32,
+        torch.bfloat16: torch.int16,
+        torch.float16: torch.int16,
+    }
+
+    @staticmethod
+    def _ft801_state_fingerprint(pool, slots) -> list:
+        """Exact per-(surface, layer) integer fingerprints of each slot's linear state. #801 b9bw.
+
+        ``pool`` is a :class:`LinearStatePool`; ``slots`` is one live GDN state slot per request
+        (``Req.linear_slot_idx``, else ``Req.table_idx`` -- `attention/linear.py`'s own rule).
+        Returns one ``{surface: [hash per layer]}`` dict per slot, in the order asked.
+
+        ⛔ **MODEL-AGNOSTIC, like every other #801 hook in this file, and here it is load-bearing.**
+        It reads only `LinearStatePool`'s public tensors and finds the declared SIBLING states by
+        iterating ``pool.slot_states`` -- so PLE's two pools are covered without `ple` being named
+        in the engine, and a state some other model's config declares is covered the day it is
+        declared.
+
+        ⛔⛆ **THE CURRENCY IS BITS, NOT CLOSENESS.** Bullet 9's gate is byte-identical served text,
+        and 9bt already refused to tighten `test_ple_verify_801.py`'s ``assert_close`` to
+        ``torch.equal`` because THAT goes red on correct code. This is the other side of that
+        decision: it asserts nothing about the numbers, it reports only whether two arms hold the
+        SAME BITS. A tolerance here would hide exactly the accumulation the round is hunting --
+        and ``-0.0``, and a NaN's identity with itself, are gated so nobody "fixes" it into a
+        float compare.
+
+        ⛔ The surface order is SORTED, not insertion order: two arms are two container loads, and
+        a reader that lined the columns up by whatever order a config happened to declare would
+        compare the wrong state and call it a divergence.
+        """
+        surfaces = [("conv", pool.conv_states), ("recurrent", pool.recurrent_states)]
+        surfaces += [(n, pool.slot_states[n]) for n in sorted(pool.slot_states)]
+        index = torch.as_tensor(
+            list(slots), dtype=torch.int64, device=pool.conv_states.device
+        )
+
+        rows, names, widths = [], [], []
+        for name, states in surfaces:
+            # [L, B, *rest] -- `index_select` COPIES, so the result is contiguous and the
+            # `.view(dtype)` below is a bit reinterpretation rather than a raise on a strided
+            # slice.
+            picked = states.index_select(1, index)
+            flat = picked.reshape(picked.shape[0] * picked.shape[1], -1)
+            if flat.dtype in Engine._FT801_BITS:
+                flat = flat.view(Engine._FT801_BITS[flat.dtype])
+            bits = flat.to(torch.int64)
+            # ⛔⛆ NOT A SUM. A plain sum is blind to a PERMUTATION -- precisely the shape a state
+            # written by a chunked verify path against a per-token decode path can take. The
+            # second moment is what makes a value's POSITION part of the fingerprint. Both
+            # products wrap in int64: two's complement, deterministic, and a hash rather than an
+            # arithmetic claim.
+            weight = torch.arange(
+                1, bits.shape[1] + 1, dtype=torch.int64, device=bits.device
+            )
+            mixed = bits.sum(-1) * 0x100000001B3 + (bits * weight).sum(-1)
+            rows.append(mixed.reshape(picked.shape[0], picked.shape[1]))
+            names.append(name)
+            widths.append(picked.shape[0])
+
+        # ⭐ ONE copy to the host for every surface, every layer and every request in the batch,
+        # which is why the seam takes a LIST of slots rather than one. It runs on every forward of
+        # an instrumented load, on BOTH arms; a `tolist` per surface per request would put four
+        # syncs times the batch size inside the decode loop (#912's watch).
+        table = torch.cat(rows, dim=0).tolist()
+        out = []
+        for j in range(len(index)):
+            fp, at = {}, 0
+            for name, width in zip(names, widths):
+                fp[name] = [int(table[at + i][j]) for i in range(width)]
+                at += width
+            out.append(fp)
+        return out
+
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
         use_graph = self.graph_runner.can_use_cuda_graph(batch)
@@ -925,11 +1152,290 @@ class Engine:
             # -> stale expert outputs) as a loud error instead of silent corruption.
             self.cpu_moe_executor.raise_if_unhealthy()
 
-        for req in batch.reqs:
-            req.complete_one()
+        # ── #801 round 6 bullet 8: verify, or today's path exactly ────────────────────
+        # ⛔⛆ `mtp_verify_step` REPLACES the three statements below for a staged verify step -- it
+        # does not wrap them. `complete_one` advances by exactly ONE and would have to be undone;
+        # `logits[: batch.size]` keeps the VERIFY row and DROPS the bonus row; and the sampler
+        # draws one token per REQUEST where a verify step needs one per ROW. It returns `None` on
+        # every batch that was not staged (every prefill, every flag-off row, every no-draft
+        # decode step), and the `else` below is then the image's own code, byte for byte.
+        #
+        # ⛔⛆ IT CARRIES A HOST SYNC, AND THAT IS AN OPERATOR DECISION (2026-09-12), NOT AN
+        # OVERSIGHT. `complete_one()` runs BEFORE the sampler today, which is legal only because
+        # the advance is `+1` and needs no token values; a verify step's advance is `accepted_len`,
+        # a device tensor off the sampler. `scheduler.py::overlap_loop` PREPARES batch N+1 before
+        # it DRAINS batch N, so the advance cannot be deferred to the drain. Option (a) -- sync on
+        # speculative steps only -- was chosen; `models/qwen4_exp/spec.py`'s bullet-8 header has
+        # the three grounds. ⛔ The sync is a REAL COST OF SPECULATION and bullet 9 banks it as its
+        # own line rather than absorbing it into the tok/s number.
+        #
+        # ⛔ MODEL-AGNOSTIC, like every other #801 hook here: a model without `mtp_verify_step`
+        # never reaches the branch at all.
+        # ⭐⭐⭐ #801 r6 bullet 9bj: COMMITCHECK -- `cached_len` READ ON BOTH SIDES OF THE COMMIT.
+        # ⛔⛆ 9bi measured a reply whose KV held 63 generated tokens while the drains were handed
+        # 62, and could not say which of two things happened: a commit advanced `cached_len` past
+        # the `accepted_len` it was given, or a commit never reached a drain at all. The publish
+        # rows CANNOT decide it -- they sample `cached_len` once per DRAIN, and by then
+        # `overlap_loop` has launched the next forward, whose commit is already in the number
+        # (9be measured that phase and was right to refuse to flag it per row). Both reads here
+        # are inside ONE `forward_batch`, so no phase can get between them.
+        # ⭐ ONE SITE FOR BOTH ADVANCE PATHS: `mtp_verify_step` -> `spec.commit_verify` for a
+        # staged row, `req.complete_one()` for every prefill, flag-off row and no-draft step. A
+        # dial that watched only `commit_verify` could not add up to the reply's KV total.
+        # ⭐ MEASUREMENT-SAFE, like PUBCHECK and the retire ledger: python ints the request
+        # already holds, and `staged.committed` is host integers by its own contract (filled by
+        # `verify_step` AFTER the sync). No device read, no second forward, nothing that makes
+        # `can_use_cuda_graph` decline the capture. ⇒ a decode figure off a COMMITCHECK load MAY
+        # be banked as the arm's.
+        # ⭐ OFF BY DEFAULT and the budget is read ONCE per Engine: a row that never sets the dial
+        # pays one `getattr` per forward. `FREETOKEN_MTP801_COMMITCHECK=N` counts FORWARDS (not
+        # drains, not retires), set by `arm_mtp_801.sh` from `FT801_COMMITCHECK`.
+        # ⛔ MODEL-AGNOSTIC: it reads the step the model staged on the batch, never an import.
+        # ⭐⭐⭐ #801 r6 b9cb: HIDDENCHECK's key, captured on the ENTRY side of the commit. See the
+        # builder's edit 10 header for why it is taken here and printed below.
+        # ⚠ `take()` SPENDS a unit and returns None cheaply when the dial is off, so a row that
+        #   never sets it pays one `getattr` and one int compare per forward -- COMMITCHECK's
+        #   standard. The peek/spend split `gdncheck_instrumented` needs does not arise: there is
+        #   exactly one call site and it always goes on to print.
+        _ft801_hc_take = getattr(self.model, "mtp_hiddencheck_take", None)
+        _ft801_hc_buf = _ft801_hc_take() if _ft801_hc_take is not None else None
+        _ft801_hc_entry = None
+        _ft801_hc_rows = 0
+        if _ft801_hc_buf is not None:
+            _ft801_hc_entry = []
+            for req in batch.reqs:
+                _ft801_hc_entry.append(
+                    {
+                        "uid": getattr(req, "uid", None),
+                        # ⛔⛆ **NO `prompt_fp` HERE, UNLIKE STATECHECK'S ROW, AND TWO REASONS
+                        #   AGREE.** 9bz measured it DEGENERATE -- all five cells came back under
+                        #   one hash, because under a chat template the leading 32 ids are the
+                        #   system preamble -- so it keys nothing that `max_device_len` does not.
+                        #   And computing it costs `input_ids[:32].sum()`, a DEVICE READ, inside
+                        #   the region `test_the_dial_reads_nothing_off_the_device` slices to
+                        #   prove COMMITCHECK is measurement-safe. ⇒ the entry capture is python
+                        #   ints only, and the single sync of this dial is the buffer read below.
+                        "max_device_len": int(req.max_device_len),
+                        # ⛔ THE ENTRY POSITION. Read after the commit this is one row late.
+                        "cached_len": int(req.cached_len),
+                        # ⛔⛆ **ABSOLUTE, NOT A ROW COUNT** -- `core.py::Req` sets
+                        #   `device_len = len(input_ids)` and asserts `cached_len < device_len`,
+                        #   so at position 11,470 it reads 11,471. It is carried for the record;
+                        #   the ROW COUNT is `extend_len` below. #801 r6 b9cf.
+                        "device_len": int(req.device_len),
+                        # ⭐⭐⭐ THE ROWS THIS FORWARD RUNS FOR THIS REQUEST -- `device_len -
+                        #   cached_len`, which is 1 on a plain decode step, 2 on a verify step and
+                        #   the CHUNK on a prefill. ⛔⛆ 9cb used `device_len` here and the FIRST
+                        #   PREFILL CHUNK HID IT: at `cached_len == 0` the two are equal, so the
+                        #   wrong formula is exactly right on the one forward every load runs
+                        #   first, and wrong on every forward after it.
+                        "extend_len": int(req.extend_len),
+                        # ⭐ Where this request's rows START in the forward. The layer writes rows
+                        #   in batch order, so a request owns `[at, at + extend_len)`.
+                        "at": _ft801_hc_rows,
+                    }
+                )
+                _ft801_hc_rows += int(req.extend_len)
+        _ft801_cc_left = getattr(self, "_ft801_commitcheck_left", None)
+        if _ft801_cc_left is None:
+            _ft801_cc_left = int(os.getenv("FREETOKEN_MTP801_COMMITCHECK", "0") or 0)
+        _ft801_cc_before = None
+        if _ft801_cc_left > 0:
+            self._ft801_commitcheck_left = _ft801_cc_left - 1
+            _ft801_cc_before = [
+                (getattr(req, "uid", None), int(req.cached_len), int(req.device_len))
+                for req in batch.reqs
+            ]
+        next_tokens_gpu = None
+        if hasattr(self.model, "mtp_verify_step"):
+            next_tokens_gpu = self.model.mtp_verify_step(
+                batch,
+                logits,
+                args,
+                page_size=self.ctx.page_size,
+                linear_pool=self.linear_state_pool,
+            )
+        if next_tokens_gpu is None:
+            for req in batch.reqs:
+                req.complete_one()
 
-        batch_logits = logits[: batch.size]
-        next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
+            batch_logits = logits[: batch.size]
+            next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
+        else:
+            next_tokens_gpu = next_tokens_gpu.to(torch.int32)
+            batch_logits = logits[: next_tokens_gpu.shape[0]]
+        # ⭐⭐⭐ #801 r6 bullet 9bn: THE DRAINED FORWARD'S OWN POST-COMMIT `cached_len`, CARRIED.
+        # ⛔⛆ `_process_last_data` runs ONE FORWARD LATE -- `overlap_loop` schedules, prepares and
+        # FORWARDS batch N (whose commit lands on the host, right above) before it drains batch
+        # N-1. So `req.cached_len` read in the drain is the NEXT forward's post-commit value on
+        # every row -- 36 of 36 on load 25's banked ledger, 0 of 36 the drained forward's own --
+        # and `publish_plan` judged the *length* verdict one position ahead. The verify arm then
+        # finished one generated token early and the next drain hit `already_finished` and shipped
+        # nothing: the `kv 63 / published 62` gap, in the act (README *Bullet 9bm*).
+        # ⛔⛆ IT CANNOT BE RECOVERED DOWNSTREAM. After any commit `device_len == cached_len + 1`
+        # ALWAYS, so the gap between the two carries nothing about the next forward's width. The
+        # number exists only here, and only for the moment between the advance and the return.
+        # ⭐⭐ ON THE BATCH, NOT ON THE REQUEST, and that is the design decision. `scheduler/
+        # decode.py::schedule_next_batch` builds a FRESH `Batch` every forward, and the drain
+        # already holds the batch it is draining (`last_data[0].batch`) -- the same carrier
+        # `batch.ft801_verify_step` uses and the bullet-8 publish slice already trusts. A copy held
+        # on the REQUEST would be the next forward's by drain time, and a two-deep rotation reads
+        # two advances stale exactly when the request skipped the next forward (finished, aborted,
+        # or simply not scheduled) -- a partial carrier whose residue reads as a FLAKY one-token
+        # loss, which is the worst failure mode this round could ship.
+        # ⭐ BOTH ADVANCE PATHS, ONE SITE: `mtp_verify_step` -> `spec.commit_verify` for a staged
+        # row, `req.complete_one()` for every prefill, flag-off row and no-draft step. A
+        # `VerifyStep`-only field would cover only the first, and the contamination is set by the
+        # NEXT forward's width -- so an UNSTAGED drain on a speculating row is contaminated too.
+        # ⛔ NOT A DIAL AND NOT GUARDED. This is the served path, not an instrument: a dial would
+        # make the correct verdict conditional on a measurement flag being set. It costs one python
+        # int per request per forward, off values the request already holds -- no device read,
+        # nothing that makes `can_use_cuda_graph` decline the capture.
+        # ⛔ MODEL-AGNOSTIC: plain ints on the batch, no import, and a drain that does not find the
+        # attribute falls back to the image's own `not req.can_decode`.
+        batch.ft801_post_commit = tuple(int(req.cached_len) for req in batch.reqs)
+        if _ft801_cc_before is not None:
+            # ⚠ `accepted` is recorded as -1 rather than raised when the staged step is short,
+            #   for PUBCHECK's reason: an instrument may not kill the row it is measuring.
+            #   A no-draft / prefill / flag-off forward advances by one through `complete_one`,
+            #   which IS an `accepted_len` of 1 and is recorded as such.
+            _ft801_cc_step = getattr(batch, "ft801_verify_step", None)
+            _ft801_cc_acc = list(getattr(_ft801_cc_step, "committed", ()) or ())
+            print(
+                "[#801] commitcheck: "
+                + _ft801_json.dumps(
+                    {
+                        "left": _ft801_cc_left,
+                        "staged": _ft801_cc_step is not None,
+                        "is_prefill": bool(getattr(batch, "is_prefill", False)),
+                        "reqs": [
+                            {
+                                "uid": uid,
+                                "accepted": (
+                                    1
+                                    if _ft801_cc_step is None
+                                    else (
+                                        int(_ft801_cc_acc[i])
+                                        if i < len(_ft801_cc_acc)
+                                        else -1
+                                    )
+                                ),
+                                "cached_len_before": cached_before,
+                                "cached_len_after": int(batch.reqs[i].cached_len),
+                                "device_len_before": device_before,
+                                "device_len_after": int(batch.reqs[i].device_len),
+                                "delta": int(batch.reqs[i].cached_len) - cached_before,
+                            }
+                            for i, (uid, cached_before, device_before) in enumerate(
+                                _ft801_cc_before
+                            )
+                        ],
+                    }
+                ),
+                file=_ft801_sys.stderr,
+                flush=True,
+            )
+        # ⭐⭐⭐ #801 r6 bullet 9bx: STATECHECK -- the COMMITTED linear state, fingerprinted, on
+        # BOTH arms. See the builder's edit 9 header for why it is read here and nowhere else.
+        _ft801_sc_left = getattr(self, "_ft801_statecheck_left", None)
+        if _ft801_sc_left is None:
+            _ft801_sc_left = int(os.getenv("FREETOKEN_MTP801_STATECHECK", "0") or 0)
+        if _ft801_sc_left > 0 and self.linear_state_pool is not None:
+            self._ft801_statecheck_left = _ft801_sc_left - 1
+            # ⛔ `attention/linear.py`'s OWN rule: the hybrid-radix live slot when allocated, else
+            #   `table_idx`. Reading the other one is a different request's state on every load
+            #   this round has run.
+            _ft801_sc_slots = [
+                (req.linear_slot_idx if req.linear_slot_idx is not None else req.table_idx)
+                for req in batch.reqs
+            ]
+            _ft801_sc_fp = Engine._ft801_state_fingerprint(
+                self.linear_state_pool, _ft801_sc_slots
+            )
+            print(
+                "[#801] statecheck: "
+                + _ft801_json.dumps(
+                    {
+                        "left": _ft801_sc_left,
+                        "staged": getattr(batch, "ft801_verify_step", None) is not None,
+                        "is_prefill": bool(getattr(batch, "is_prefill", False)),
+                        "reqs": [
+                            {
+                                "uid": getattr(req, "uid", None),
+                                # ⛔ The cross-ARM key. A uid is whatever order the scheduler
+                                #   happened to admit requests in; these two are the same on
+                                #   either arm for the same cell, and constant for the life of
+                                #   the request. ⚠ `prompt_fp` reads the LEADING ids, so it is
+                                #   stable only while the prompt is longer than the window --
+                                #   which every cell this round serves is, and the reader says so.
+                                "prompt_fp": (
+                                    int(req.input_ids[:32].to(torch.int64).sum())
+                                    * 0x100000001B3
+                                    + int(req.input_ids[:32].numel())
+                                ),
+                                "max_device_len": int(req.max_device_len),
+                                "cached_len": int(req.cached_len),
+                                "device_len": int(req.device_len),
+                                "slot": int(_ft801_sc_slots[i]),
+                                "fp": _ft801_sc_fp[i],
+                            }
+                            for i, req in enumerate(batch.reqs)
+                        ],
+                    }
+                ),
+                file=_ft801_sys.stderr,
+                flush=True,
+            )
+        # ⭐⭐⭐ #801 r6 bullet 9cb: HIDDENCHECK -- layer 0's seven block tensors, per row, on BOTH
+        # arms. Keyed by the ENTRY values captured above, never by `req.cached_len` as it reads
+        # here. See the builder's edit 10 header.
+        if _ft801_hc_entry is not None:
+            # ⭐ ONE host copy, sliced to the rows this forward actually wrote. The buffer is
+            #   sized for the largest batch the capture resolver reserved, and copying all of it
+            #   would put thousands of stale integers in the log on every decode step.
+            _ft801_hc_table = _ft801_hc_buf[:, :_ft801_hc_rows].tolist()
+            for _ft801_hc_req in _ft801_hc_entry:
+                _ft801_hc_at = _ft801_hc_req.pop("at")
+                # ⛔ NUMBERS, NO NAMES: `engine.py` may not import `spec.py`. The order is
+                #   `spec.FT801_HIDDENCHECK_NAMES` and the reader is what names it.
+                _ft801_hc_req["fp"] = [
+                    [_ft801_hc_t[_ft801_hc_at + _ft801_hc_i] for _ft801_hc_t in _ft801_hc_table]
+                    for _ft801_hc_i in range(_ft801_hc_req["extend_len"])
+                ]
+            print(
+                "[#801] hiddencheck: "
+                + _ft801_json.dumps(
+                    {
+                        "staged": getattr(batch, "ft801_verify_step", None) is not None,
+                        "is_prefill": bool(getattr(batch, "is_prefill", False)),
+                        "tensors": len(_ft801_hc_table),
+                        "reqs": _ft801_hc_entry,
+                    }
+                ),
+                file=_ft801_sys.stderr,
+                flush=True,
+            )
+        if hasattr(self.model, "mtp_shadow_step"):
+            # ── #801 round 5 bullet 4: the real draft step, after the real sampler ──────────
+            # Read-only: never feeds back into `next_tokens_gpu` or anything downstream of it.
+            # Duck-typed like every other #801 hook, so this file stays model-agnostic
+            # (`models/qwen4_exp/model.py`'s own docstring: "imports nothing qwen4exp-specific").
+            # ⛔⛆ RE-ENTER `self.ctx.forward_batch(batch)` -- the `with` above (line 921) has
+            # already EXITED by this point, so `Context._batch` is back to `None`. The head's own
+            # forward runs the SAME MoE layer type the backbone does, and `moe.py::forward` reads
+            # `get_global_ctx().batch.is_prefill` unconditionally; outside any `forward_batch`
+            # scope that raises `AssertionError: No active batch in context` (found on this
+            # round's own GPU box load, `check_shadow_load_801.sh`, 2026-09-12 -- the CPU-only
+            # wiring suite spies on `draft_next_token_ids` and so never runs the real MoE forward
+            # that needed this). `forward_host_ctx` is deliberately NOT re-entered alongside it:
+            # it is the disk-PLE prefetch hook and the head "ships no PLE tensors" (`mtp.py`'s own
+            # assertion), so the head's forward never touches what it guards.
+            with self.ctx.forward_batch(batch):
+                # ⛔ #801 round 5 bullet 7b: `batch_logits` is the TARGET's own distribution `p`,
+                # which the acceptance mass (`draft.py::acceptance_mass`) needs alongside the
+                # head's `q`. Passed, not recomputed: the sampler above already has it, and a
+                # second forward would be both a cost and a second chance to differ.
+                self.model.mtp_shadow_step(next_tokens_gpu, batch, args, batch_logits)
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)

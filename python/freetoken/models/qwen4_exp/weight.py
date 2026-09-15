@@ -6,7 +6,9 @@ Three separate paths, because the checkpoint's three weight classes live in diff
 * :func:`load_ple_table` -- the 47.7 GiB FP8 n-gram table, 128 checkpoint shards concatenated into one pinned :class:`HostBank`.
 * :func:`load_nvfp4_expert_sources` -- the routed NVFP4 experts, into the offload cache's source banks.
 
-Dropped: ``mtp.*`` (speculative head, including its stacked ``mtp.layers.0.mlp.experts.*``).
+Dropped: ``mtp.*`` (speculative head) unless ``FREETOKEN_LOAD_MTP=1`` -- see
+:func:`mtp_load_enabled`. Its stacked ``mtp.layers.N.mlp.experts.*`` pair is dropped either way:
+those are the head's 512 routed experts and they come from an NVFP4 bank, not the state dict.
 ``model.visual.*`` -- the 333-tensor, 897,862,112 B BF16 vision tower -- is gated on
 ``config.is_multimodal`` (i.e. ``FREETOKEN_LOAD_VISION=1``) and dropped when it is off.
 """
@@ -35,6 +37,27 @@ from tqdm import tqdm
 
 if TYPE_CHECKING:
     from freetoken.models.config import LinearGatedDeltaGroupConfig, ModelConfig
+
+# ── #801 overlay marker ──────────────────────────────────────────────────────────────
+# This file is `models/qwen4_exp/weight.py` from image
+# `llm-server/freetoken-gfx1201:2026-09-09-agree-0022` (md5 474b1de68daa80d9fe6aa10040aadddf,
+# 586 lines) BIND-MOUNTED over the installed package, plus the lines in this block and the
+# `mtp.*` branch of `_rename`. ⛔ It is NOT a patch in the Dockerfile ladder and NOT in any image.
+#
+# ⚠ WHY A MARKER EXISTS AT ALL. A `-v` that silently does not take -- wrong path inside the image,
+#   a typo'd source, a file the container cannot read -- leaves the row loading the IMAGE's weights
+#   while every log line looks exactly like the arm we think we launched (#866). So the override
+#   announces itself and the gate reads the line rather than trusting the mount.
+#
+# ⚠ stderr, not a logger: this module has none, and stderr is what `docker logs` captures.
+import sys as _ft801_sys
+
+print(
+    "[#801] overlay ACTIVE: models/qwen4_exp/weight.py bind-mounted from the repo "
+    f"(pid {os.getpid()}, base md5 474b1de68daa80d9fe6aa10040aadddf)",
+    file=_ft801_sys.stderr,
+    flush=True,
+)
 
 # Routed NVFP4 experts (nvidia modelopt layout): per-expert, un-fused. Matched against the RAW
 # weight_map key in nvfp4_banks. The ``model.language_model.`` anchor excludes the MTP head's
@@ -294,11 +317,211 @@ def _shard_for_rank(
 
 _VISION_PREFIXES = ("model.visual.", "visual.")
 
+# ── #801 bullet 4 — the MTP head, opt-in ─────────────────────────────────────────────────────
+# The head is 31 tensors / 4,973 MiB the deployed rows have never loaded (ADR 0011 calls its
+# absence intrinsic). Keeping it is opt-in for the same reason vision is: it is resident weight
+# that text serving never touches, and the rows in `/etc` must be unchanged by this file existing.
+_MTP_PREFIX = "mtp."
+# ⛔⛆ The head's routed experts are STACKED -- `mtp.layers.0.mlp.experts.gate_up_proj` [512, 1280,
+#   2560] and `.down_proj` [512, 2560, 640], 4,800 of the head's 4,973 MiB, and **bf16, not
+#   NVFP4**. They are excluded even with the flag on: they belong in an NVFP4 expert bank, and
+#   putting 4.7 GiB of bf16 experts on the card costs ~1,780 of 5,960 cache slots, i.e. -13 %
+#   decode by #723's curve -- more than the head can win back. Note `_EXPERT_RE` does NOT catch
+#   them: it wants `.mlp.experts.<digits>.`, and these have no per-expert index.
+_MTP_STACKED_EXPERT_RE = re.compile(r"^mtp\.layers\.\d+\.mlp\.experts\.")
+# Mirrors `models/config.py:16 vision_load_enabled` -- the same truthy words, the same strip and
+# lowercase -- kept local rather than imported so this reader owns its own gate.
+# ⛔ Not a truthiness test: `FREETOKEN_LOAD_MTP=0` is how an operator turns it OFF.
+_MTP_TRUE = {"1", "true", "yes", "on"}
 
-def _rename(raw_name: str, *, include_vision: bool) -> str | None:
-    """Checkpoint key -> FreeToken state-dict key, or None to skip."""
-    if raw_name.startswith("mtp."):
-        return None
+
+def mtp_load_enabled() -> bool:
+    """Whether to keep the checkpoint's multi-token-prediction head (default OFF, llm-server #801).
+
+    ⛔ Keeping the keys is not loading the head: `layers/base.py` rejects a state-dict key with no
+    receiving module, so this flag only becomes usable once the head module exists. Until then it
+    is how the loader is proven to keep exactly the right 29 tensors, off the box.
+    """
+    return os.getenv("FREETOKEN_LOAD_MTP", "0").strip().lower() in _MTP_TRUE
+
+
+def mtp_run_enabled() -> bool:
+    """Whether a RESIDENT head is also FORWARDED on every step (llm-server #801 round 4 bullet 7).
+
+    ⭐ Two dials, not one, and this is the second: `mtp_load_enabled` decides whether the head's 29
+    tensors are kept and the module built; this decides whether `Qwen4ExpForCausalLM.forward` runs
+    it. ⛔ The default is ON whenever the head is loaded -- a resident head that never runs opens
+    none of the three pools bullet 7 exists to open -- so this exists to turn the forward OFF
+    (``FREETOKEN_MTP801_RUN_HEAD=0``) while keeping the head resident. That splits "the head does
+    not fit / does not load" from "the head does not run", which are different failures wearing
+    the same OOM.
+
+    ⛔ It does NOT gate the pools. The pools are sized from the head's EXISTENCE (the module is
+    built, its `mlp.experts` is an `OffloadMoELayer` the cache walk already finds), so turning the
+    forward off changes what runs, never what is allocated -- otherwise the off arm would be
+    measuring a different machine.
+    """
+    return os.getenv("FREETOKEN_MTP801_RUN_HEAD", "1").strip().lower() in _MTP_TRUE
+
+
+def mtp_shadow_enabled() -> bool:
+    """Whether the REAL draft step runs alongside decode (llm-server #801 round 5 bullet 4).
+
+    ⭐ A third dial, independent of both `mtp_load_enabled` (keep the head resident) and
+    `mtp_run_enabled` (round 4's stand-in: forward the head on `batch.input_ids`, discard the
+    output, purely to exercise kernels/pools/graph sizing). This one runs `draft.py`'s REAL
+    invocation -- the head fed the token the sampler actually just chose -- and checks its guess
+    against the next step's real token via `shadow.py::ShadowTracker`. ⛔ Default OFF: unlike
+    `mtp_run_enabled`, nothing here is required for the pools to open, so there is no reason to
+    default it on.
+
+    ⛔ Read once, at construction (`Qwen4ExpForCausalLM.__init__`), same as `_mtp_run` -- so a
+    captured decode graph and an eager step can never disagree about whether shadow mode is on.
+    """
+    return os.getenv("FREETOKEN_MTP801_SHADOW", "0").strip().lower() in _MTP_TRUE
+
+
+def mtp_draft_capture_enabled() -> bool:
+    """Whether `mtp_shadow_step` replays a CAPTURED graph instead of calling `draft.py` eagerly
+    (llm-server #801 round 5 bullet 6, `t_draft` captured).
+
+    ⭐ A fourth dial, independent of `mtp_shadow_enabled` (which this one REQUIRES: there is no
+    draft step to capture with shadow mode off). ⛔ Default OFF, same reasoning as
+    `mtp_shadow_enabled` — nothing here is required for the pools to open, and bullet 7 needs BOTH
+    arms (eager, captured) bankable from separate loads, not one arm silently always-on.
+
+    ⛔ Read once, at construction, same as the other three dials — a captured decode graph and an
+    eager step must never disagree about which mode built the model.
+    """
+    return os.getenv("FREETOKEN_MTP801_DRAFT_CAPTURE", "0").strip().lower() in _MTP_TRUE
+
+
+def mtp_verify_enabled() -> bool:
+    """``FREETOKEN_MTP801_VERIFY=1``: run the draft token through a real VERIFY step (llm-server
+    #801 round 6) instead of shadow mode's draft-and-discard.
+
+    ⛔ Default OFF, same reasoning as every other dial here: nothing in this round is required
+    for the pools to open, and round 6's two loads want the verify arm and the round-5 baseline
+    from separate loads rather than one arm silently always-on.
+
+    ⛔ Read once, at construction. A captured decode graph and an eager step must never disagree
+    about which mode built the model -- and here that is sharper than usual, because this dial is
+    what decides whether a SECOND set of CUDA graphs gets captured at all.
+    """
+    return os.getenv("FREETOKEN_MTP801_VERIFY", "0").strip().lower() in _MTP_TRUE
+
+
+def mtp_verify_graph_max_bs() -> int:
+    """``FREETOKEN_MTP801_VERIFY_GRAPH_MAX_BS``: the largest batch size the VERIFY graph set is
+    captured for. Default 4 -- the deployed row's `-np4-`.
+
+    ⛔ VRAM, and it is why this is a cap rather than the T=1 set's own `max_graph_bs` (160 by
+    default). `models/qwen4_exp/gdn.py` reserves a `[max_bs, width, HV, Dk, Dv]` fp32
+    intermediate-states buffer per GDN layer -- ~1.5 MiB per (request, step) per rank, so 36
+    layers at bs=4 T=2 is ~432 MiB per rank and bs=160 would be tens of GiB.
+
+    ⚠ A batch above the cap is not an error: `GraphRunner.can_use_cuda_graph` simply refuses it
+    and the step runs eager.
+    """
+    return max(0, int(os.getenv("FREETOKEN_MTP801_VERIFY_GRAPH_MAX_BS", "4") or 0))
+
+
+def mtp_draft_alternate_enabled() -> bool:
+    """``FREETOKEN_MTP801_DRAFT_ALTERNATE=1``: flip the head's draft between the CAPTURED graph
+    and the EAGER call on alternate decode steps, timing each into its own window (#801 round 5
+    bullet 7b).
+
+    ⭐⭐ **Why an interleave and not two loads.** `t_draft` eager and `t_draft` captured only mean
+    something as a RATIO — bullet 6's captured graph exists to beat bullet 5's eager baseline —
+    and this box's decode level is per-load configuration, not a constant (#912: three
+    non-overlapping clusters on byte-identical loads). Two loads would put that lottery INSIDE
+    the one comparison the whole of bullet 6 was for. Alternating within a single load removes
+    it: both arms see the same weights, the same cache state and the same thermal envelope,
+    interleaved at step granularity.
+
+    ⛔ It only ever engages where the captured path is eligible at all: bs=1 AND greedy
+    (`capture.py::DraftGraphRunner` is both). On a sampled or bs>1 step every draft runs eager
+    regardless of this dial, so the eager window keeps collecting and the captured one simply
+    does not grow.
+
+    ⛔⛆ It assumes the two paths PREDICT THE SAME TOKEN — otherwise α would be measured on a
+    mixture of two drafters. That is not assumed here: `FREETOKEN_MTP801_DRAFTCHECK=N` is the
+    gate that establishes it, on the same load, and bullet 7d runs it before anything is banked.
+    """
+    return os.getenv("FREETOKEN_MTP801_DRAFT_ALTERNATE", "0").strip().lower() in _MTP_TRUE
+
+
+_MTP_HEAD_DTYPES = {"nvfp4", "bf16"}
+
+
+def mtp_head_dtype() -> str:
+    """Which form the head's 512 routed experts load in: ``"nvfp4"`` (default) or ``"bf16"``
+    (llm-server #801 round 5 bullet 1).
+
+    ⭐ ``"nvfp4"`` is round 2-4's path unchanged: the stacked bf16 pair is dropped here and
+    filled from :func:`mtp_bank_path`'s offload bank instead. ⛔ ``"bf16"`` is a ROUND-5,
+    RESEARCH-ONLY fidelity control (α_bf16 vs α_nvfp4) -- it keeps the checkpoint's own
+    stacked tensors and feeds them to a plain resident module (`mtp.py::_ResidentBf16HeadMoE`)
+    that never touches the shared offload-bank/cache path. It is never what a deployed row
+    would use: see that class's docstring for the pool-sizing gap it does not close.
+    """
+    value = os.getenv("FREETOKEN_MTP801_HEAD_DTYPE", "nvfp4").strip().lower()
+    if value not in _MTP_HEAD_DTYPES:
+        raise ValueError(
+            f"FREETOKEN_MTP801_HEAD_DTYPE={value!r} is not one of {sorted(_MTP_HEAD_DTYPES)}"
+        )
+    return value
+
+
+def mtp_bank_path() -> str:
+    """The head's NVFP4 expert bank, an OPERATOR dial with no default (llm-server #801).
+
+    ⛔⛆ There is no fallback path on purpose. The head's 512 routed experts are NOT in the
+    checkpoint in a form the loader can use -- `_MTP_STACKED_EXPERT_RE` drops the bf16 stacked pair
+    on every path -- so a missing bank is not "degrade to the checkpoint", it is a head whose MoE
+    would read whatever the cache's slab happened to hold. :func:`load_mtp_expert_source_banks`
+    takes the path as an ARGUMENT rather than reading the environment itself (bullet 5), so this
+    is the one place the dial is spelled and the one place it can be missing.
+    """
+    path = os.getenv("FREETOKEN_MTP_BANK", "").strip()
+    if not path:
+        raise ValueError(
+            "FREETOKEN_LOAD_MTP=1 needs FREETOKEN_MTP_BANK=<path to the head's NVFP4 expert "
+            "bank>. The checkpoint's `mtp.layers.N.mlp.experts.*` are stacked bf16 and are "
+            "dropped on every path; llm-server #801 round 2 built the NVFP4 bank they are "
+            "replaced by."
+        )
+    return path
+
+
+def _rename(
+    raw_name: str, *, include_vision: bool, include_mtp: bool, head_dtype: str = "nvfp4"
+) -> str | None:
+    """Checkpoint key -> FreeToken state-dict key, or None to skip.
+
+    ⚠ ``include_vision``/``include_mtp`` are REQUIRED keywords. A default would make a call
+    site that forgot one invisible both here and at run time, which is the failure this loader
+    cannot afford: the symptom is a silently smaller state dict, not an error.
+
+    ⚠⚠ ``head_dtype`` deliberately BREAKS that rule (llm-server #801 round 5 bullet 1) -- its
+    default, ``"nvfp4"``, is round 2-4's already-gated DROP behaviour, so a call site that
+    forgets it degrades to the safe, already-tested direction rather than a silently smaller
+    state dict. Only the one new caller that wants the bf16 control passes ``"bf16"``
+    explicitly; every existing call site (and test) is unaffected.
+    """
+    if raw_name.startswith(_MTP_PREFIX):
+        if not include_mtp:
+            return None
+        if _MTP_STACKED_EXPERT_RE.match(raw_name):
+            if head_dtype == "bf16":
+                # kept: _ResidentBf16HeadMoE fills these from the checkpoint's own bf16
+                # bytes, unchanged -- see mtp.py for the module that receives them
+                return raw_name
+            return None  # the head's 512 routed experts: an NVFP4 bank, not the state dict
+        # ⚠ Returned UNCHANGED. The head sits at `mtp.`, not under `model.language_model.`, so
+        # there is no prefix to strip -- and what the receiving module is called is the draft
+        # head's own bullet to decide, not this one's.
+        return raw_name
     if raw_name.startswith(_VISION_PREFIXES):
         # ``model.visual.blocks.0.attn.qkv.weight`` -> ``visual.blocks.0.attn.qkv.weight``.
         return (
@@ -371,6 +594,9 @@ def iter_weights(
 
     config = parse_config(cached_load_hf_config(model_path))
     include_vision = config.is_multimodal
+    # Read ONCE: the loop below runs on all 296,475 index keys.
+    include_mtp = mtp_load_enabled()
+    head_dtype = mtp_head_dtype()
 
     fuse_buf: dict[str, dict[int, torch.Tensor]] = {}
     for file in tqdm(
@@ -380,7 +606,12 @@ def iter_weights(
     ):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             for raw_name in f.keys():
-                name = _rename(raw_name, include_vision=include_vision)
+                name = _rename(
+                    raw_name,
+                    include_vision=include_vision,
+                    include_mtp=include_mtp,
+                    head_dtype=head_dtype,
+                )
                 if name is None:
                     continue
                 tensor = f.get_tensor(raw_name)
@@ -577,9 +808,109 @@ def load_nvfp4_expert_sources_parallel(
     )
 
 
+# ── #801 bullet 5 — the MTP head's routed experts, from a pre-built NVFP4 bank ───────────────
+# The head's own 512 routed experts are the checkpoint's `mtp.layers.0.mlp.experts.{gate_up,down}
+# _proj` -- STACKED and **bf16**, 4,800 of the head's 4,973 MiB. `_rename` drops them even with
+# `FREETOKEN_LOAD_MTP=1` (putting 4.7 GiB of bf16 experts on the card costs ~1,780 of 5,960 cache
+# slots, i.e. -13 % decode by #723's curve), so they arrive instead as the NVFP4 source bank
+# llm-server #801 round 2 requantised off them, one file, six tensors, 1,419,510,312 B.
+#
+# ⛔ THIS ONLY READS THE BANK. Handing it to a live `OffloadMoeCache` means the cache has a slab
+#   for bank layer `num_moe_layers` -- the same "the pools are not sized for the head's layer id"
+#   gap that `mtp.py::draft_config` records for the KV pool and the QSA backend. Both are
+#   llm-server #801's bullet 7 and both are OPEN. ⛔ Do not size a pool from here.
+#
+# ⚠ The path is an ARGUMENT, not an environment read: the bank is not in the checkpoint and not in
+#   the image, so which file it is is the caller's decision, and bullet 7 owns the operator dial.
+_MTP_BANK_NAMES = (
+    "gate_up_packed", "gate_up_scale", "gate_up_global",
+    "down_packed", "down_scale", "down_global",
+)
+
+
+def load_mtp_expert_source_banks(
+    bank_path: str, config, *, num_mtp_layers: int = 1
+) -> dict[str, list[torch.Tensor]]:
+    """The head's NVFP4 expert source banks, in the shape :func:`load_nvfp4_expert_sources` returns.
+
+    ``{bank name: [one [E, ...] tensor per head MoE layer]}`` -- the offload cache's source
+    contract, so the head's experts can be registered exactly like a 49th backbone layer's.
+
+    ⭐ The allocation and the TP split are the ENGINE's own (`_alloc_nvfp4_host_banks` and
+    `_intermediate_shard`, imported rather than re-spelled): a bank this function shaped by hand
+    would agree with itself and with nothing else. ⚠ Both are private to
+    `models/nvfp4_banks.py`; that is the price of not restating six shapes and a two-constraint
+    split, and llm-server #801's suite gates that they still exist.
+
+    ⛔⛆ ``gate_up`` is stacked ``[gate(I) | up(I)]`` on its ROW axis, so this rank's ``I`` columns
+    are TWO slices, not one chunk -- a flat row chunk gives rank 0 all of gate and none of up, at
+    the right shape and with plausible values. ``down`` carries ``I`` as its PACKED axis (two fp4
+    per byte) and its BLOCK axis (one scale per 16), which is why the offsets are divided.
+    """
+    from freetoken.models.nvfp4_banks import _alloc_nvfp4_host_banks, _intermediate_shard
+
+    E = config.num_experts
+    H = config.hidden_size
+    I = config.moe_intermediate_size
+    want = {
+        "gate_up_packed": (E, 2 * I, H // 2),
+        "gate_up_scale": (E, 2 * I, H // 16),
+        "gate_up_global": (E, 2 * I),
+        "down_packed": (E, H, I // 2),
+        "down_scale": (E, H, I // 16),
+        "down_global": (E, H),
+    }
+
+    Ip, I_lo = _intermediate_shard(I)  # TP: this rank's columns of every expert (#725)
+    banks = _alloc_nvfp4_host_banks(num_mtp_layers, E, H, Ip)
+    out = {name: [b.tensor for b in banks[name]] for name in _MTP_BANK_NAMES}
+
+    with safetensors.safe_open(bank_path, framework="pt", device="cpu") as f:
+        present = set(f.keys())
+        if present != set(_MTP_BANK_NAMES):
+            raise ValueError(
+                f"MTP expert bank {bank_path} holds {sorted(present)}, expected "
+                f"{sorted(_MTP_BANK_NAMES)}"
+            )
+        for name in _MTP_BANK_NAMES:
+            src = f.get_tensor(name)
+            if tuple(src.shape) != want[name]:
+                raise ValueError(
+                    f"MTP expert bank {bank_path}: {name} is {tuple(src.shape)}, the head's "
+                    f"geometry (E={E}, H={H}, I={I}) implies {want[name]}"
+                )
+            dst = out[name][0]
+            if name.startswith("gate_up"):
+                # ⛔⛆ the two halves, separately: [gate | up] on the row axis.
+                dst[:, :Ip] = src[:, I_lo:I_lo + Ip]
+                dst[:, Ip:] = src[:, I + I_lo:I + I_lo + Ip]
+            elif name == "down_packed":
+                dst[:] = src[:, :, I_lo // 2:(I_lo + Ip) // 2]
+            elif name == "down_scale":
+                dst[:] = src[:, :, I_lo // 16:(I_lo + Ip) // 16]
+            else:  # down_global: [E, H], no I axis to split
+                dst[:] = src
+
+    if torch.cuda.is_available():
+        for name in _MTP_BANK_NAMES:
+            for bank in banks[name]:
+                bank.pin()
+    return out
+
+
 __all__ = [
     "PleTable",
     "iter_weights",
+    "load_mtp_expert_source_banks",
+    "mtp_bank_path",
+    "mtp_draft_alternate_enabled",
+    "mtp_draft_capture_enabled",
+    "mtp_head_dtype",
+    "mtp_load_enabled",
+    "mtp_run_enabled",
+    "mtp_shadow_enabled",
+    "mtp_verify_enabled",
+    "mtp_verify_graph_max_bs",
     "load_nvfp4_expert_sources",
     "load_nvfp4_expert_sources_parallel",
     "load_ple_table",

@@ -1,3 +1,21 @@
+# ── #801 overlay marker ──────────────────────────────────────────────────────────────────────
+# This file is `attention/linear.py` from image
+# `llm-server/freetoken-gfx1201:2026-09-09-agree-0022` (md5 2965d5439d6cc88bbac1f5dd7d857adc,
+# 140 lines) BIND-MOUNTED over the installed package, plus this block and ONE edit in
+# `build_fla_metadata`'s decode branch. ⛔ In no image and in no Dockerfile ladder -- it must be
+# in `arm_mtp_801.sh`'s OVERLAY and ORIGS lists or the row runs the image's copy silently (#866).
+#
+# ⛔⛆ WHY IT EXISTS. `build_fla_metadata` is the ONE owner of the GDN query indptr, and its decode
+#   branch hard-codes `cu_seqlens = arange(bs + 1)` -- one token per request. The fused fla kernel
+#   derives each request's step count as `cu_seqlens[i+1] - cu_seqlens[i]`, so with that indptr a
+#   #801 verify step's SECOND token is never stepped: the recurrence silently runs one token and
+#   the extra q/k/v rows are simply not read. Same shape as `attention/qsa_sparse.py`'s stale
+#   `arange` (round 6 bullet 4) and gated the same way, by differential against this `.orig`.
+#
+# ⚠ The scheduler calls this function (`scheduler.py`), and so does `gdn.py` lazily, so overlaying
+#   it covers both without a `scheduler.py` overlay. The CAPTURED path builds its own `FLAMetadata`
+#   in `engine/graph.py::GraphCaptureBuffer.set_batch` and is NOT fixed here -- that is bullet 6.
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -65,9 +83,20 @@ def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:
 
     if batch.is_decode:
         bs = len(reqs)
-        cu_seqlens = torch.arange(bs + 1, dtype=torch.int32, device=device)
         # the scheduler stages linear_table_idx from gdn_slot (decode), reused as-is here
         assert batch.linear_table_idx is not None
+        # #801: a verify step forwards T tokens for a speculating request, so the GDN indptr is
+        # ragged exactly as a prefill's is -- `arange(bs + 1)` IS its one-token special case, and
+        # is kept verbatim for it so the every-served-row step allocates and copies nothing new.
+        lens = [r.extend_len for r in reqs]
+        if sum(lens) == bs:
+            cu_seqlens = torch.arange(bs + 1, dtype=torch.int32, device=device)
+        else:
+            cu_seqlens = (
+                torch.tensor([0, *lens], dtype=torch.int32, **pin)
+                .cumsum_(0)
+                .to(device, non_blocking=True)
+            )
         return FLAMetadata(cu_seqlens=cu_seqlens, cache_indices=batch.linear_table_idx)
 
     # prefill: cumsum of query (extend) lengths, per-request slot + continuation flags.

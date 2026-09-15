@@ -1,3 +1,24 @@
+# ── #801 overlay marker ──────────────────────────────────────────────────────────────────────
+# This file is `layers/embedding.py` from image
+# `llm-server/freetoken-gfx1201:2026-09-09-agree-0022` (md5 9c138b30f0641b4aa562d7f7201558ac,
+# 125 lines) BIND-MOUNTED over the installed package, plus this block and ONE condition in
+# `ParallelLMHead.forward`. ⛔ In no image and in no Dockerfile ladder -- it must be in
+# `arm_mtp_801.sh`'s OVERLAY and ORIGS lists or the row runs the image's copy silently (#866).
+#
+# ⛔⛆ WHY IT EXISTS (round 6 bullet 6, and it was NOT in the round's plan). `forward`'s
+#   tensor-parallel gather has a fast path guarded on `bs == 1`, where `bs` is `batch.size` --
+#   REQUESTS, not rows. It is only the general path's answer when the forward carried ONE ROW.
+#   A #801 verify step forwards TWO rows for one request, and at TP=2 that reshape concatenates
+#   RANK 0's two tokens where the general path interleaves ONE TOKEN's two ranks: one row out
+#   instead of two, and the values are not the row's logits.
+#
+# ⛔ SILENT ONLY AT TP=1, AND THIS ROUND IS TP=2 THROUGHOUT. bs=1 + TP=2 is the round's own
+#   measured shape, so the verify graph cannot even be CAPTURED through the image's version --
+#   `GraphCaptureBuffer.logits[:rows] = model.forward()` gets one row where it expects two.
+#   Gated by differential against `.orig` in `test_graph_capture_801.py
+#   ::TestTheLmHeadReturnsOneRowPerTokenNotPerRequest`, which also pins that every shape served
+#   today (one row, any TP) comes back byte-identical.
+
 from __future__ import annotations
 
 from typing import Dict
@@ -116,7 +137,11 @@ class ParallelLMHead(VocabParallelEmbedding):
         input_shape = logits.shape
         output_tensor = self._comm.all_gather(logits)
 
-        if bs == 1:
+        # #801: ONE ROW, not one request. `all_gather` returns [tp * rows, vocab_tp] rank-major,
+        # so `view(1, -1)` is the interleave the general path below does only when rows == 1.
+        # A verify step (bs == 1, two rows) would otherwise get rank 0's two TOKENS glued
+        # together, at half the row count, with nothing erroring.
+        if input_shape[0] == 1:
             return output_tensor.view(1, -1)[:, : self.num_embeddings]
 
         output_tensor = output_tensor.view((self.tp_size,) + input_shape)
