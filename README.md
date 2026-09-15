@@ -1,3 +1,42 @@
+> ## ⚠ You are on branch `rocm-gfx1201` — a fork branch, not upstream FreeToken
+>
+> This branch adds **AMD RDNA4 (`gfx1201`, Radeon AI PRO R9700) support for
+> Qwen3.8-Flash-Next-NVFP4**: the ROCm kernel work that makes it serve at all, tensor parallelism
+> across two cards, and image input. It is 19 commits on upstream
+> [`4b94bdc3`](https://github.com/FlashML-org/FreeToken/commit/4b94bdc38a46a4dfe534e8793126160d56904c44).
+>
+> ### 📖 **[README.gfx1201.md](README.gfx1201.md) is the documentation for this branch.** Read it before running anything.
+>
+> **Build:** `docker build -f Dockerfile.gfx1201 -t freetoken-gfx1201:local .`
+>
+> **Three settings are mandatory and nothing tells you when one is missing:**
+>
+> ```
+> --expert-load parallel                        # `auto` picks serial here => ~100x slower load
+> -e PYTORCH_ALLOC_CONF=expandable_segments:False   # :True GPU-FAULTS on gfx1201 — and torch's
+>                                                   #   own OOM message advises :True
+> -e HIP_VISIBLE_DEVICES=0                      # or 0,1 for --tp-size 2 — always explicit
+> ```
+>
+> ### ⛔ Known defects — the two that can hurt you
+>
+> - **Image token positions are wrong on this branch**, and so is everything after them. The
+>   checkpoint declares M-RoPE; this branch implements none of it and feeds 1-D positions. Nothing
+>   errors and the answer reads fine. **Text-only requests are provably exact.**
+>   ⭐ Upstream merged a correct M-RoPE implementation in
+>   [#454](https://github.com/FlashML-org/FreeToken/pull/454) on 2026-09-13 — for image *quality*,
+>   upstream's vision path is better than this one.
+> - **Nothing bounds the number of images in one request.** A single legal request can exhaust
+>   **host** RAM and take the machine down mid-request. The existing caps bound the *sum* of soft
+>   tokens, not the image count. See README.gfx1201.md §2.2 for the mitigations.
+>
+> ⚠ TP=2 + images is the least-tested combination here. No quality or fidelity claim is made
+> anywhere: this work has no fidelity instrument.
+>
+> ---
+>
+> *Upstream's own README follows, unchanged.*
+
 <div align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/FlashML-org/FreeToken/main/assets/freetoken-logo-dark.svg">
