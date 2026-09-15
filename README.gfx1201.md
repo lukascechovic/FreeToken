@@ -370,10 +370,13 @@ Four rules, so that anyone reading a commit here knows what it is:
 4. **Upstream is upstream.** This is a fork branch, not a competing distribution. Where upstream has
    landed the same capability (§3), upstream's is the one to use.
 
-⚠ **What is NOT on this branch:** a multi-token-prediction draft head for this model. It exists on
-this box and it is worth **+24 % decode at TP=1**, but it is delivered as generated run-time overlay
-files rather than as a commit here, so it is not part of this tree. Upstream **#421** is the open
-thread asking for it.
+⚠ **What is NOT on this branch:** a multi-token-prediction draft head for this model. It is worth
+**+24.2 % decode at TP=1** and a **1.0 % loss at TP=2**, and it lives on **`rocm-gfx1201-mtp`** —
+this branch plus one commit, documented in `README.mtp.md` there. ⛔ It is a separate branch on
+purpose: this one's whole claim is that its head tree equals the tree of the image the deployed rows
+serve, and the MTP row runs *that same image* plus run-time file mounts, so no image anywhere
+contains that code. A commit here would break the claim by construction. Upstream **#421** is the
+open thread asking for the capability.
 
 ---
 
