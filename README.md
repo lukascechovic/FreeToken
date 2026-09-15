@@ -1,3 +1,37 @@
+> ## ⚠ You are on branch `rocm-gfx1201-mtp` — `rocm-gfx1201` plus a multi-token-prediction draft head
+>
+> One commit on top of [`rocm-gfx1201`](../../tree/rocm-gfx1201): a **speculative draft head for
+> Qwen3.8-Flash-Next-NVFP4**, 24 files. Everything the parent branch says still applies.
+>
+> ### 📖 **[README.mtp.md](README.mtp.md) is the documentation for this branch** — read it *after*
+> ### **[README.gfx1201.md](README.gfx1201.md)**, which carries the three mandatory settings.
+>
+> **It will not load without two things the parent branch does not need:**
+>
+> ```
+> -e FREETOKEN_LOAD_MTP=1          # plus six more — README.mtp.md §2
+> -e FREETOKEN_MTP_BANK=/…/mtp-experts-nvfp4.safetensors
+> ```
+>
+> ⛔ That 1.42 GB bank is **not published**. You build it from your own checkpoint with
+> `tools/make_mtp_bank.py` — README.mtp.md §3. A row without it does **not** fall back.
+>
+> ### ⛔ What it is worth, both directions
+>
+> - **+24.2 % decode at TP=1** (one card, ~12k context, batch size 1). ⛔ **A 1.0 % loss at TP=2**,
+>   and the two shapes' numbers may not be carried onto each other.
+> - **Not lossless: 1 flip in 602 generations.** Chased to closure — it is bf16 rounding in the
+>   verify path, not a correctness bug — but this branch **emits different text** from the
+>   non-MTP rows. Not wrong; different.
+> - ⛔ **No concurrency claim at all.** Every number is batch size 1; bs>1 is unmeasured.
+>
+> ⚠ No quality or fidelity claim is made anywhere: this work has no fidelity instrument.
+>
+> ---
+>
+> *The `rocm-gfx1201` banner follows — it describes the branch this one is cut from, and all of it
+> applies here. Upstream's own README follows that, unchanged.*
+
 > ## ⚠ You are on branch `rocm-gfx1201` — a fork branch, not upstream FreeToken
 >
 > This branch adds **AMD RDNA4 (`gfx1201`, Radeon AI PRO R9700) support for
