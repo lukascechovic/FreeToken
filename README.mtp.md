@@ -13,14 +13,35 @@ before it will load.
 - **Build:** the parent's `Dockerfile.gfx1201`, unchanged — §4.
 - **Run:** §2 for the environment, §3 for the expert bank. The bank has **no default** and a row
   without it does not fall back.
-- ⛔ **Honest status:** §1. It is a **+24.2 % decode win at TP=1** and a **1.0 % loss at TP=2**, and
-  it emits different text from the non-MTP rows.
+- ⛔ **Honest status:** §1 — ⛔⛆ and it was **corrected on 2026-09-15**: read **§1.0 before quoting
+  any number from this file**. Short version: at **TP=2 it is a ~+12 % decode win** on served
+  traffic, and at **TP=1 the headline +24.2 % is a like-for-like figure the deployment does not
+  get**. Either way it emits different text from the non-MTP rows.
 
 ---
 
 ## 1. ⛔ What it is worth, and what it costs — measured, both directions
 
-### 1.1 ⭐ TP=1, one card: **+24.2 % decode**
+### ⛔⛆ 1.0 CORRECTION, 2026-09-15 — both headline numbers are LIKE-FOR-LIKE, and the deployment reading differs
+
+⭐ Nothing below is withdrawn. §1.1 and §1.2 are arithmetically intact and each is stated against a
+control differing in **one** environment variable. What they are **not** is the answer to *"should I
+turn this on"* — and until this correction the file read as though they were.
+
+| | §1.1 / §1.2 say | the deployment reading |
+|---|---|---|
+| **TP=1** | +24.2 % | ⛔ **−9.3 %.** Both arms ran `--ple-backend disk`, because `pinned` + MTP **does not fit** at TP=1 — the bank pins **full width in one process** (each TP=2 rank pins half). So the real choice is `disk`+MTP at **21.82 tok/s** against `pinned` **without** MTP at **~24**. Break-even needs the disk tax under **19.53 %**; it measures **27 %**. |
+| **TP=2** | −1.0 % | ⭐ **+12.2 %.** The −1.0 % is **α 0.6062's** number, measured on two prose cells. A census of the live row — 6 requests, **21,303** checked draft steps — reads α **0.6363 … 0.9363**, pooled by token **0.8153**, every request clearing break-even **0.618**. At the measured step cost that is **+12.2 %**, and the traffic this row serves sits **at or above** the pooled figure ⇒ read it as a **floor** (~+20 % at the top of the census range). |
+
+⛔ **What kind of number +12.2 % is:** step cost × acceptance, both measured on matched arms in one
+session — **not** an A/B of served traffic. The only direct decode A/B at TP=2 *is* the −1.0 %, and
+the same arithmetic reproduces it at that acceptance. ⇒ the model and the measurement agree; what
+moves between them is **α**, and a prose corpus understates what real traffic accepts.
+
+⛔⛆ **The rule this file now carries:** a decode number means nothing without **the α it was taken
+at** and **the PLE backend both arms ran**. Quote §1.1 or §1.2 **with §1.0, or not at all**.
+
+### 1.1 ⭐ TP=1, one card: **+24.2 % decode** — ⛔ `disk`-vs-`disk`, not the deployment choice (§1.0)
 
 Four loads, MTP on versus MTP off, same row, same box, 2026-09-14:
 
@@ -44,12 +65,20 @@ Four loads, MTP on versus MTP off, same row, same box, 2026-09-14:
   `FREETOKEN_LOAD_MTP=0`, so nothing the port changes is charged to MTP by accident. The off arm
   measured exactly **1.0000 tok/forward over 11,280 forwards**.
 
-### 1.2 ⛔ TP=2, two cards: a **1.0 % loss** at batch size 1
+### 1.2 ⛔ TP=2, two cards: a **1.0 % loss** at α 0.6062 — ⛔⛆ and the served row runs higher (§1.0)
 
-Measured separately, with the served sampler: **0.9901×**. ⛔ The two shapes have **different**
-step-cost ratios and you may not carry one onto the other — TP=2's `S` = 1.6222 applied to this
-box's acceptance rate predicts **+0.6 %**, i.e. it would report the +24 % TP=1 row as break-even.
-⇒ **the win above is TP=1's, and only TP=1's.**
+Measured separately, with the served sampler: **0.9901×**, on a probe corpus whose two scored cells
+ran α **0.6036** and **0.6088** — below TP=2's break-even of **0.618**. ⛔ The two shapes have
+**different** step-cost ratios and you may not carry one onto the other: TP=2's `S` = 1.6222 applied
+to §1.1's acceptance rate predicts **+0.6 %**, i.e. it would report the +24 % TP=1 row as break-even.
+
+⛔⛆ **What this figure is NOT: the served row's gain.** It is what the row does *at α 0.6062*, and
+the live row does not run there — see **§1.0**. A census of its own `[#801] alpha` lines over ~2 h of
+ordinary use (6 requests, 21,303 checked draft steps) reads **0.6363 … 0.9363**, pooled by token
+**0.8153**, with **every** request above break-even ⇒ **+12.2 %**, worst single real request
+**+1.1 %**. ⚠ The third cell of that probe — a coding task, α **0.6641**, the only one of the three
+clearing break-even — was dropped by a zlib content filter for missing its threshold by **0.0093**.
+⇒ the −1.0 % was measured on the two cells **least** like served traffic.
 
 ### 1.3 ⛔ No concurrency claim at all
 
