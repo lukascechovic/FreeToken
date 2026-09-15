@@ -1,0 +1,313 @@
+# FreeToken on AMD RDNA4 (gfx1201, Radeon AI PRO R9700) — the build file for branch `rocm-gfx1201`.
+#
+#   git clone --branch rocm-gfx1201 https://github.com/lukascechovic/FreeToken.git
+#   cd FreeToken
+#   docker build -f Dockerfile.gfx1201 -t freetoken-gfx1201:local .
+#
+# Read `README.gfx1201.md` before you run what this builds. Three environment settings are
+# MANDATORY at run time and the engine does not tell you when one is missing; one of them is
+# a setting PyTorch's own out-of-memory message will advise you to set the other way.
+#
+# ──────────────────────────────────────────────────────────────────────────────────────────────
+# ⛔ WHAT THIS FILE IS, AND WHAT IT IS NOT
+#
+# It builds THE TREE YOU HAVE CHECKED OUT. Nothing is fetched, nothing is patched: on this branch
+# the ROCm/TP=2/vision work is already 19 commits on top of upstream `4b94bdc3`, so there is
+# nothing left to apply. (The branch is DERIVED from a patch series kept elsewhere — see
+# README.gfx1201.md §"Where this branch comes from" — and that series' own Dockerfile clones
+# upstream and applies 20 `.patch` files. ⛔ Do not copy that one here: applying a patch whose
+# content is already a commit fails, and failing is the good case.)
+#
+# ⇒ there is deliberately NO `ARG FREETOKEN_TREE` here. The series' Dockerfile asserts a typed
+#   tree hash because "the patch applied" must never be taken on trust. On a branch that hash is
+#   circular — this very file is part of the tree it would name, so any value typed before the
+#   commit lands is wrong the moment it lands, and every future commit on an append-only branch
+#   invalidates it again. What replaces it is below: the build RECORDS the commit and tree it
+#   actually built (derived, never typed) and then asserts the port BY CONTENT.
+#
+# ⛔ THE BASE IS PINNED BY DIGEST AND THAT PIN IS THE REPRODUCIBILITY STORY.
+#   `rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.11.0` is a MUTABLE tag on someone
+#   else's registry. We have watched a moved tag swap the engine under a served row with nothing
+#   erroring. Do not relax this to the tag. An unpinned ROCm base is a different compiler.
+#
+# ⚠ TESTED ON gfx1201 (Radeon AI PRO R9700) ONLY. gfx1200 is untested here; RDNA3 and older are
+#   not this branch's target. Change `ARG GPU_ARCH` at your own risk and expect to debug kernels.
+#
+# ⛔ NEVER set FREETOKEN_BANK_CUDA_ALLOC (forces cudaHostAlloc — a reboot-only wedge on this box).
+# ⛔ NEVER set PYTORCH_ALLOC_CONF=expandable_segments:True — on gfx1201 it produces a GPU MEMORY
+#    FAULT, not an out-of-memory error. See README.gfx1201.md; the engine forces it on and this
+#    branch's run recipe forces it back off.
+# ⛔ NEVER set HSA_USE_SVM=0 — it routes the large host pin back onto a reboot-only ioctl.
+# ──────────────────────────────────────────────────────────────────────────────────────────────
+
+FROM rocm/pytorch@sha256:a223aee17aef5d21c3b9f63436dd19d27d1c665ec8b2f40011c9546cabae2a80
+
+# ── The three things a replicator changes ─────────────────────────────────────────────────────
+# 1. GPU_ARCH    — build-time. gfx1201 is what this branch is tested on.
+# 2. HIP_DEVICES — the card(s) this image will serve on. Baked as a DEFAULT only; override per
+#                  container with `docker run -e HIP_VISIBLE_DEVICES=…`, and always set it
+#                  explicitly. `0` here means "one card, the first one", which is the TP=1 shape.
+#                  ⛔ For --tp-size 2 you want `0,1`.
+# 3. the MODEL   — deliberately NOT in this image. Weights are mounted at run time
+#                  (`-v /your/models:/models:ro`), never baked; see README.gfx1201.md.
+ARG GPU_ARCH=gfx1201
+ARG HIP_DEVICES=0
+
+ENV PYTORCH_ROCM_ARCH=${GPU_ARCH} \
+    FREETOKEN_ROCM_ARCH=${GPU_ARCH} \
+    HIP_VISIBLE_DEVICES=${HIP_DEVICES} \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# ⚠ The whole checkout, `.git` included. The history is what lets the step below record WHICH
+#   commit produced this image, from inside the image, without anyone typing a hash.
+COPY . /opt/FreeToken
+
+# ── Provenance, derived and never typed ───────────────────────────────────────────────────────
+# ⛔ A source tarball or a `git worktree` checkout is REFUSED here, on purpose: without history the
+#   image cannot say what it is, and "which tree is this" is the only question that matters when a
+#   served row misbehaves months later. Build from a plain `git clone`.
+RUN set -eux; \
+    git config --global --add safe.directory /opt/FreeToken; \
+    cd /opt/FreeToken; \
+    if ! git rev-parse --git-dir >/dev/null 2>&1; then \
+      echo "FATAL: /opt/FreeToken has no git history."; \
+      echo "       Build from a plain 'git clone --branch rocm-gfx1201', not from a source"; \
+      echo "       tarball, a GitHub zip download, or a 'git worktree' checkout (whose .git is"; \
+      echo "       a file pointing outside the build context)."; \
+      exit 1; \
+    fi; \
+    git config user.email build@localhost; git config user.name build; \
+    COMMIT="$(git rev-parse HEAD)"; \
+    git add -A; \
+    TREE="$(git write-tree)"; \
+    DIRTY="$(git status --porcelain | head -20)"; \
+    echo "built from commit: ${COMMIT}"; \
+    echo "built tree:        ${TREE}"; \
+    if [ -n "${DIRTY}" ]; then \
+      echo "⚠ WORKING TREE WAS NOT CLEAN — this image is NOT any published commit."; \
+      echo "${DIRTY}"; \
+    fi; \
+    printf '%s\n' "commit ${COMMIT}" "tree   ${TREE}" > /opt/FreeToken-BUILD-PROVENANCE.txt
+
+# ── Install ───────────────────────────────────────────────────────────────────────────────────
+# --no-build-isolation preserves the base image's ROCm-enabled torch. Build isolation would
+# resolve a fresh CUDA torch off PyPI and link the two C++/HIP extensions against the wrong
+# libtorch — it builds, and then nothing works.
+# ⛔ NOT installed with [accel]: flashinfer and sgl_kernel are CUDA-only, and this branch's ROCm
+#   commit gates them off anyway.
+RUN set -eux; \
+    cd /opt/FreeToken; \
+    python -m pip install --no-cache-dir "setuptools>=77" wheel; \
+    python -m pip install --no-cache-dir --no-build-isolation -e .
+
+# ── Kernel / JIT caches ───────────────────────────────────────────────────────────────────────
+# ⛔⛆ AITER and Triton key their caches on the DIRECTORY, not on the image. A directory shared
+#   between two images lets one image run the other's compiled kernels, and nothing errors.
+#   ⇒ give every image its own cache dir, and WIPE it if the image ID changes.
+# ⚠ The variables the engine actually reads are XDG_CACHE_HOME and FREETOKEN_KERNEL_CACHE_DIR
+#   (plus TRITON_CACHE_DIR for Triton). If you have seen `FREETOKEN_CACHE_DIR` in someone's run
+#   script: it is read by NOTHING. Do not rely on it.
+ENV XDG_CACHE_HOME=/root/.cache/freetoken-gfx1201 \
+    TRITON_CACHE_DIR=/root/.cache/freetoken-gfx1201/triton \
+    FREETOKEN_KERNEL_CACHE_DIR=/root/.cache/freetoken-gfx1201/freetoken/kernels
+RUN mkdir -p /root/.cache/freetoken-gfx1201/triton \
+             /root/.cache/freetoken-gfx1201/freetoken/kernels
+
+# ── The base is what it claims to be ──────────────────────────────────────────────────────────
+# Checked by running it, not by reading the tag. No GPU is touched.
+# ⚠ Written as a one-line `python -c`, NOT as a shell heredoc: a heredoc inside RUN needs
+#   the BuildKit `# syntax=docker/dockerfile:1.4` frontend, which is one more thing to fetch
+#   and one more thing to go wrong on a machine that has never built this.
+RUN set -eux; \
+    python -c 'import torch, triton, sys; print("torch", torch.__version__, "| hip", torch.version.hip, "| cuda", torch.version.cuda, "| triton", triton.__version__, "| python", sys.version.split()[0]); assert torch.version.hip, "FATAL: not a ROCm torch - the base digest is wrong"; assert torch.version.cuda is None, "FATAL: a CUDA torch was resolved; build isolation leaked in"'
+
+# ──────────────────────────────────────────────────────────────────────────────────────────────
+# THE PORT, CHECKED BY CONTENT
+#
+# ⛔ Every gate below asserts that the code is PRESENT. Not one of them asserts that a feature is
+#   ON, or that it works: vision, TP=2 and the disk PLE are all run-time flags. These gates exist
+#   so that "I built the right branch" is never taken on trust — build `main` by mistake and they
+#   fail here, loudly, instead of at load time on a box with the model already mounted.
+#
+# ⚠ ABSENCE gates are written as `if grep …; then exit 1; fi`, NEVER as `! grep -q …`. Under
+#   `set -e` a command whose value is inverted with `!` does NOT exit the shell (bash manual,
+#   "The shell does not exit if the command that fails is ... part of any command executed in a
+#   && or || list ... or if the command's return value is being inverted with !"). The terse form
+#   makes an absence gate SILENTLY INERT — it can never fail, which is worse than not having it.
+# ──────────────────────────────────────────────────────────────────────────────────────────────
+
+# 1. The model this branch exists to serve, and the ROCm work under it.
+RUN set -eux; \
+    cd /opt/FreeToken; \
+    test -f python/freetoken/models/qwen4_exp/ple.py; \
+    test -f python/freetoken/attention/qsa_sparse.py; \
+    test -f python/freetoken/kvcache/qsa_pool.py; \
+    grep -q "class PinnedUVATable" python/freetoken/models/qwen4_exp/ple.py; \
+    grep -q '"freetoken.models.qwen4_exp"' python/freetoken/models/register.py; \
+    grep -q 'RadixArk/Qwen3.8-Flash-Next-NVFP4' python/freetoken/kernel/aot_models.py; \
+    grep -q '"qsa_sparse"' python/freetoken/attention/__init__.py; \
+    grep -q 'FREETOKEN_ROCM_TRITON_ROUTER' python/freetoken/moe/fused.py; \
+    echo "OK  qwen4_exp + ROCm router present by content"
+
+# 2. ⭐ The LDS clamp — the one commit without which this engine is useless on RDNA, and the one
+#    with no counterpart anywhere upstream. Unclamped, the QSA prefill kernel asks for more LDS
+#    than an RDNA workgroup has, and the engine serves PROMPTS OF AT MOST 15 TOKENS before the
+#    worker dies. A chat template alone is longer than that.
+#    The md5 pins the whole kernel file: this is the file to be surest about.
+RUN set -eux; \
+    cd /opt/FreeToken; \
+    grep -q '_lds_budget = 60 \* 1024' python/freetoken/kernel/triton/qsa/attend.py; \
+    grep -q 'while block_n > 16' python/freetoken/kernel/triton/qsa/attend.py; \
+    test "$(md5sum python/freetoken/kernel/triton/qsa/attend.py | cut -d" " -f1)" \
+       = "cf24ce9976b07cd39231a3277f6ab104"; \
+    echo "OK  RDNA LDS clamp present, attend.py md5 pinned"
+
+# 3. The vision tower and image ingest.
+#    ⛔ PRESENCE ONLY, and read README.gfx1201.md's defect list before you send a picture:
+#      image token POSITIONS on this branch are wrong, silently, and so is everything after them.
+RUN set -eux; \
+    cd /opt/FreeToken; \
+    test -f python/freetoken/models/qwen4_exp/vision.py; \
+    test -f python/freetoken/multimodal.py; \
+    grep -q 'class Qwen4ExpVisionModel' python/freetoken/models/qwen4_exp/vision.py; \
+    grep -q 'class Qwen4ExpVisionPatchMerger' python/freetoken/models/qwen4_exp/vision.py; \
+    grep -q 'class LayerNorm' python/freetoken/layers/norm.py; \
+    grep -q '"visual\."' python/freetoken/models/config.py; \
+    grep -q 'def vision_load_enabled' python/freetoken/models/config.py; \
+    grep -q 'def encode_images' python/freetoken/models/qwen4_exp/model.py; \
+    grep -q 'class MultimodalProcessor' python/freetoken/multimodal.py; \
+    grep -q 'def decode_anthropic_source' python/freetoken/multimodal.py; \
+    grep -q 'max_multimodal_prompt_tokens' python/freetoken/server/args.py; \
+    echo "OK  vision tower + both ingest surfaces present by content"
+
+# 4. The disk-streamed PLE (upstream PR #311, carried here for RDNA).
+#    ⛔⛆ `--ple-backend` DEFAULTS TO `disk`. On ONE card that costs ~27 % of decode on this
+#    hardware, silently. A TP=1 row MUST pass `--ple-backend pinned` explicitly.
+#    ⚠ Its stream-memop fast path dlopens libcuda, which does not exist on ROCm, so the expected
+#    log line is `sync=launch-gating`. A `wait-sync` reading here is a finding, not a pass.
+RUN set -eux; \
+    cd /opt/FreeToken; \
+    test -f python/freetoken/models/qwen4_exp/ple_disk.py; \
+    test -f python/freetoken/kernel/csrc/ple_store/ple_store_ext.cpp; \
+    grep -q 'class DiskRowTable' python/freetoken/models/qwen4_exp/ple_disk.py; \
+    grep -q 'serves_all_heads = True' python/freetoken/models/qwen4_exp/ple_disk.py; \
+    grep -q 'serves_all_heads' python/freetoken/models/qwen4_exp/ple.py; \
+    grep -q '"--ple-backend"' python/freetoken/server/args.py; \
+    grep -q 'ple_backend: str = "disk"' python/freetoken/engine/config.py; \
+    grep -q 'forward_host_ctx' python/freetoken/engine/engine.py; \
+    grep -q '__NR_io_uring_setup' python/freetoken/kernel/csrc/ple_store/ple_store_ext.cpp; \
+    ls python/freetoken/kernel/_ple_store*.so; \
+    echo "OK  disk PLE present by content, extension built"
+
+# 5. ⭐ TENSOR PARALLELISM for qwen4_exp — the half of this branch upstream still does not have.
+#    Upstream `main` raises NotImplementedError("qwen4_exp weight loading supports TP=1 only").
+#    ⛔ The absence gate below is what proves you are not on a tree that still refuses.
+#    ⛔ PRESENCE ONLY: `--tp-size` is a run-time flag and a one-card row never enters this path.
+RUN set -eux; \
+    cd /opt/FreeToken; \
+    if grep -q 'qwen4_exp weight loading supports TP=1 only' \
+         python/freetoken/models/qwen4_exp/weight.py; then \
+      echo "FATAL: this tree still refuses --tp-size > 1 for qwen4_exp."; \
+      echo "       You are almost certainly building upstream main, or a branch that does not"; \
+      echo "       carry the TP=2 commits. Check: git rev-parse --abbrev-ref HEAD"; \
+      exit 1; \
+    fi; \
+    grep -q 'def _intermediate_shard' python/freetoken/models/nvfp4_banks.py; \
+    grep -q 'NVFP4 block size 16' python/freetoken/models/nvfp4_banks.py; \
+    grep -q 'def _ple_row_shard' python/freetoken/models/qwen4_exp/weight.py; \
+    grep -q 'local_row_base' python/freetoken/models/qwen4_exp/ple.py; \
+    grep -q 'all_gather' python/freetoken/models/qwen4_exp/ple.py; \
+    grep -q 'class LinearOProj' python/freetoken/layers/linear.py; \
+    grep -q 'LinearOProj' python/freetoken/models/qwen4_exp/attention.py; \
+    grep -q 'def make_row_parallel_quant' python/freetoken/models/quant_linear.py; \
+    grep -q 'make_row_parallel_quant' python/freetoken/models/qwen4_exp/gdn.py; \
+    grep -q 'def _shard_for_rank' python/freetoken/models/qwen4_exp/weight.py; \
+    grep -q '_SHARD_BEFORE_FUSE' python/freetoken/models/qwen4_exp/weight.py; \
+    grep -q '_SHARD_UNFUSED' python/freetoken/models/qwen4_exp/weight.py; \
+    grep -q 'def _shard_gdn' python/freetoken/models/qwen4_exp/weight.py; \
+    grep -q 'def _head_slice' python/freetoken/models/qwen4_exp/weight.py; \
+    grep -q 'def _pad_vocab_rows' python/freetoken/models/qwen4_exp/weight.py; \
+    grep -q '_VOCAB_PARALLEL' python/freetoken/models/qwen4_exp/weight.py; \
+    test -f tests/models/qwen4_exp/test_tp_shard.py; \
+    test -f tests/models/qwen4_exp/test_weight.py; \
+    test -f tests/models/qwen4_exp/test_weight_ckpt.py; \
+    echo "OK  TP>1 present by content: TP=1 gate removed, both shard axes, mixers, loader, tests"
+
+# 6. The scheduler work: image-aware prefix key, TP>1 relay handshake, all-rank failure agreement.
+RUN set -eux; \
+    cd /opt/FreeToken; \
+    test -f python/freetoken/scheduler/mm_key.py; \
+    grep -q 'def image_cache_key_ids' python/freetoken/scheduler/mm_key.py; \
+    grep -q 'def _cache_ids' python/freetoken/scheduler/cache.py; \
+    grep -q 'def _mm_bypass' python/freetoken/scheduler/cache.py; \
+    if grep -q 'req.input_ids\[' python/freetoken/scheduler/cache.py; then \
+      echo "FATAL: scheduler/cache.py still keys the prefix cache on raw input ids."; \
+      echo "       An image request would then collide with a text request that happens to"; \
+      echo "       carry the same placeholder ids. The image-aware key commit is missing."; \
+      exit 1; \
+    fi; \
+    grep -q 'cache_key_ids' python/freetoken/core.py; \
+    grep -q 'cache_key_ids' python/freetoken/message/backend.py; \
+    grep -q 'image_cache_key_ids' python/freetoken/scheduler/scheduler.py; \
+    grep -q 'def _handshake_rank_relay' python/freetoken/scheduler/io.py; \
+    grep -q 'freetoken-relay-hello' python/freetoken/scheduler/io.py; \
+    grep -q 'freetoken-relay-done' python/freetoken/scheduler/io.py; \
+    grep -q 'self._handshake_rank_relay(tp_info)' python/freetoken/scheduler/io.py; \
+    test -f tests/scheduler/test_image_prefix_key.py; \
+    test -f tests/scheduler/test_io_relay_handshake.py; \
+    echo "OK  image-aware prefix key + TP relay handshake present by content"
+
+# 7. The multimodal cost work: pre-decode admission control, a bounded ViT batch, a split image
+#    soft-token cap, a packed multimodal batch, and the encode/boundary fixes.
+#    ⛔ 0014's grouping is INERT unless FREETOKEN_VIT_GROUP is set — `0`/unset keeps the historical
+#      all-at-once path. The gate asserts the env name and the loop, never a behaviour.
+#    ⛔ The two caps measure DIFFERENT dangers and do not substitute for one another:
+#      --max-image-soft-tokens is a SUM over the request's images (the right instrument for HOST
+#      RAM) and the WRONG one for VRAM, which scales with the LARGEST SINGLE image.
+#    ⛔⛆ NEITHER of them bounds the NUMBER of images in one request. See the defect list.
+RUN set -eux; \
+    cd /opt/FreeToken; \
+    grep -q 'def estimate_soft_tokens' python/freetoken/multimodal.py; \
+    grep -q 'def estimate_prompt_soft_tokens' python/freetoken/multimodal.py; \
+    grep -q 'processor.estimate_prompt_soft_tokens' python/freetoken/server/generation.py; \
+    grep -q 'estimated > soft_limit' python/freetoken/server/generation.py; \
+    grep -q 'FREETOKEN_VIT_GROUP' python/freetoken/models/qwen4_exp/vision.py; \
+    grep -q 'def _group_size' python/freetoken/models/qwen4_exp/vision.py; \
+    grep -q 'def _forward_group' python/freetoken/models/qwen4_exp/vision.py; \
+    grep -q 'max_image_soft_tokens' python/freetoken/scheduler/config.py; \
+    grep -q 'def image_soft_token_limit' python/freetoken/scheduler/config.py; \
+    grep -q -- '--max-image-soft-tokens' python/freetoken/server/args.py; \
+    grep -q 'def _image_soft_token_limit' python/freetoken/server/generation.py; \
+    grep -q 'def images_too_large_message' python/freetoken/multimodal.py; \
+    test -f tests/server/test_multimodal.py; \
+    test -f tests/models/qwen4_exp/test_vit_group.py; \
+    echo "OK  admission control + ViT grouping + split image cap present by content"
+
+# 8. ⛔⛆ AN ABSENCE GATE, AND IT IS INVERTED ON PURPOSE — live MoE-cache resizing must NOT be here.
+#    A rung that rebuilt the expert cache from a live warm-up was written, built, measured, and
+#    then DROPPED: it cost this row 23.84 → 17.93 tok/s of decode (−24.8 %) while never preventing
+#    the allocator transition it was written for. ⛔ Its failure is SILENT — nothing errors, the
+#    row simply serves ~25 % slower from the moment it boots. The gate is kept so that nobody
+#    re-adds it by accident; if you are re-adding it deliberately, this is where you say so.
+RUN set -eux; \
+    cd /opt/FreeToken; \
+    if grep -rEq 'live_moe_kv_budget_bytes|_warmup_image_request|_finalize_moe_cache_from_live_warmup|moe-cache-auto live' \
+         python/freetoken/ tests/; then \
+      echo "FATAL: live moe-cache sizing is present in this tree. It was REMOVED deliberately:"; \
+      echo "       −24.8 % decode, silently, for a problem it did not solve."; \
+      grep -rn 'live_moe_kv_budget_bytes\|_warmup_image_request\|_finalize_moe_cache_from_live_warmup' \
+           python/freetoken/ tests/ | head -5; \
+      exit 1; \
+    fi; \
+    echo "OK  live moe-cache sizing ABSENT by content"
+
+# 9. The command the README tells you to run must exist. `ft` is a console script created by the
+#    install above; if the install half-succeeded, this is where you find out rather than at
+#    `docker run`, where the failure reads as a container problem.
+RUN set -eux; \
+    command -v ft; \
+    echo "OK  \`ft\` on PATH"
+
+RUN set -eux; cat /opt/FreeToken-BUILD-PROVENANCE.txt
+
+WORKDIR /opt/FreeToken
